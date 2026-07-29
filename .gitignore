@@ -39,6 +39,11 @@ build/Release
 
 # Dependency directories
 node_modules/
+dist/
+.poolside/agent-team/
+# Poolside project-local state and private overrides
+.poolside/settings.local.yaml
+.poolside/plans/
 jspm_packages/
 
 # Snowpack dependency directory (https://snowpack.dev/)
@@ -141,3 +146,11 @@ dist
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .vite/
+
+# Editor and operating-system metadata
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo

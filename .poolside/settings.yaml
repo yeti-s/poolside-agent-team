@@ -1,0 +1,18 @@
+mcp_servers:
+  agent-team:
+    command: node
+    args:
+      - dist/index.js
+    cwd: .
+    enabled_tools:
+      - team_create
+      - team_list
+      - team_status
+      - team_spawn
+      - task_create
+      - task_list
+      - task_update
+      - message_send
+      - message_list
+      - team_request_shutdown
+      - team_delete

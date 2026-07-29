@@ -1,0 +1,172 @@
+import assert from 'node:assert/strict'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import test from 'node:test'
+import { TeamError, TeamStore, sanitizeTeamName, validateMemberName } from './store.js'
+
+async function createTeam(store: TeamStore, overrides: Partial<{
+  teamName: string
+  description: string
+  maxMembers: number
+  tmuxSession: string
+}> = {}) {
+  return store.create({
+    teamName: 'feature-x',
+    description: 'Implement feature X',
+    maxMembers: 4,
+    tmuxSession: 'pool-team-feature-x',
+    leaderPid: process.pid,
+    ...overrides,
+  })
+}
+
+async function withStore(
+  action: (store: TeamStore) => Promise<void>,
+): Promise<void> {
+  const projectRoot = await mkdtemp(join(tmpdir(), 'pool-agent-team-'))
+  try {
+    await action(new TeamStore(projectRoot))
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true })
+  }
+}
+
+test('normalizes safe team and member names', () => {
+  assert.equal(sanitizeTeamName(' Feature X / API '), 'feature-x-api')
+  assert.equal(validateMemberName('test_runner'), 'test_runner')
+  assert.throws(() => validateMemberName('1tester'), TeamError)
+})
+test('creates one team and rejects a second active team', async () => {
+  await withStore(async store => {
+    const state = await createTeam(store)
+    assert.equal(state.team.lead, 'team-lead')
+    assert.equal(state.team.maxMembers, 4)
+    assert.equal(state.members.length, 1)
+    await assert.rejects(() => createTeam(store, { teamName: 'other-team' }), TeamError)
+  })
+})
+
+test('maintains task dependencies and refuses blocked work', async () => {
+  await withStore(async store => {
+    await createTeam(store)
+    const foundation = await store.addTask({
+      subject: 'Create API',
+      description: 'Implement API foundation',
+    })
+    const client = await store.addTask({
+      subject: 'Create client',
+      description: 'Implement client',
+      blocks: [foundation.id],
+    })
+    assert.deepEqual((await store.read())?.tasks[0]?.blockedBy, [client.id])
+    await assert.rejects(
+      () => store.updateTask(foundation.id, { status: 'in_progress' }),
+      /blocked by/,
+    )
+    await store.updateTask(client.id, { status: 'completed' })
+    const updated = await store.updateTask(foundation.id, { status: 'in_progress' })
+    assert.equal(updated.status, 'in_progress')
+  })
+})
+
+test('assigns tasks only to registered members and clears an owner', async () => {
+  await withStore(async store => {
+    await createTeam(store)
+    const task = await store.addTask({ subject: 'Test', description: 'Write tests' })
+    await assert.rejects(() => store.updateTask(task.id, { owner: 'tester' }), TeamError)
+    await store.addMember({
+      name: 'tester',
+      role: 'teammate',
+      joinedAt: new Date().toISOString(),
+      status: 'idle',
+    })
+    assert.equal((await store.updateTask(task.id, { owner: 'tester' })).owner, 'tester')
+    assert.equal((await store.updateTask(task.id, { owner: null })).owner, undefined)
+  })
+})
+
+test('delivers and marks messages addressed to a teammate', async () => {
+  await withStore(async store => {
+    await createTeam(store)
+    await store.addMember({
+      name: 'tester',
+      role: 'teammate',
+      joinedAt: new Date().toISOString(),
+      status: 'idle',
+    })
+    await store.addMessage({ from: 'team-lead', to: 'tester', body: 'Run tests' })
+    await store.addMessage({ from: 'team-lead', to: '*', body: 'Share blockers' })
+    assert.equal((await store.messagesFor('tester', true)).length, 2)
+    const status = await store.status('tester', () => false)
+    assert.equal(status.pendingMessages, 0)
+  })
+})
+
+test('serializes concurrent task creation without reusing IDs', async () => {
+  await withStore(async store => {
+    await createTeam(store)
+    const created = await Promise.all(
+      Array.from({ length: 10 }, (_, index) =>
+        store.addTask({ subject: `Task ${index}`, description: 'Concurrent task' }),
+      ),
+    )
+    assert.deepEqual(
+      created.map(task => task.id).sort((a, b) => Number(a) - Number(b)),
+      Array.from({ length: 10 }, (_, index) => String(index + 1)),
+    )
+  })
+})
+
+test('enforces a member limit that includes team-lead', async () => {
+  await withStore(async store => {
+    await createTeam(store, { maxMembers: 2 })
+    await store.addMember({
+      name: 'tester',
+      role: 'teammate',
+      joinedAt: new Date().toISOString(),
+      status: 'idle',
+    })
+    await assert.rejects(
+      () => store.addMember({
+        name: 'researcher',
+        role: 'teammate',
+        joinedAt: new Date().toISOString(),
+        status: 'idle',
+      }),
+      /member limit reached/,
+    )
+    await store.updateMember('tester', member => {
+      member.status = 'stopped'
+    })
+    await store.addMember({
+      name: 'researcher',
+      role: 'teammate',
+      joinedAt: new Date().toISOString(),
+      status: 'idle',
+    })
+  })
+})
+
+test('reads a legacy v1 state with safe v2 defaults', async () => {
+  await withStore(async store => {
+    await mkdir(join(store.projectRoot, '.poolside', 'agent-team'), { recursive: true })
+    await writeFile(store.statePath, JSON.stringify({
+      version: 1,
+      team: {
+        name: 'legacy-team',
+        createdAt: '2026-01-01T00:00:00.000Z',
+        lead: 'team-lead',
+      },
+      nextTaskNumber: 1,
+      nextMessageNumber: 1,
+      members: [{ name: 'team-lead', role: 'leader', joinedAt: '2026-01-01T00:00:00.000Z', status: 'idle' }],
+      tasks: [],
+      messages: [],
+    }))
+    const state = await store.read()
+    assert.equal(state?.version, 2)
+    assert.equal(state?.team.maxMembers, 4)
+    assert.equal(state?.team.tmuxSession, 'pool-team-legacy-team')
+  })
+})
