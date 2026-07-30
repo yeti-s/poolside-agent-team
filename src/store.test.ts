@@ -103,6 +103,26 @@ test('delivers and marks messages addressed to a teammate', async () => {
   })
 })
 
+test('preserves worker recovery metadata through state reads', async () => {
+  await withStore(async store => {
+    await createTeam(store)
+    await store.addMember({
+      name: 'recoverable',
+      role: 'teammate',
+      joinedAt: new Date().toISOString(),
+      status: 'failed',
+      sessionId: '019fb2b6-3c2d-775f-bd7a-f64434859f06',
+      terminationReason: 'error',
+      lastError: 'connection reset by peer',
+      restartCount: 2,
+    })
+    const member = (await store.read())?.members.find(item => item.name === 'recoverable')
+    assert.equal(member?.sessionId, '019fb2b6-3c2d-775f-bd7a-f64434859f06')
+    assert.equal(member?.terminationReason, 'error')
+    assert.equal(member?.restartCount, 2)
+  })
+})
+
 test('serializes concurrent task creation without reusing IDs', async () => {
   await withStore(async store => {
     await createTeam(store)

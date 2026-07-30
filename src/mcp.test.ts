@@ -64,6 +64,8 @@ test('serves agent-team tools through the MCP stdio protocol', async () => {
     const names = (tools.result as { tools: Array<{ name: string }> }).tools.map(tool => tool.name)
     assert.ok(names.includes('team_create'))
     assert.ok(names.includes('team_spawn'))
+    assert.ok(names.includes('team_adopt'))
+    assert.ok(names.includes('team_resume'))
     assert.ok(names.includes('team_interrupt'))
 
     const create = await request('tools/call', {
@@ -72,6 +74,10 @@ test('serves agent-team tools through the MCP stdio protocol', async () => {
     })
     const result = create.result as { content: Array<{ text: string }> }
     assert.equal(JSON.parse(result.content[0]!.text).team_name, 'mcp-feature')
+
+    const adopt = await request('tools/call', { name: 'team_adopt', arguments: {} })
+    const adoptResult = adopt.result as { content: Array<{ text: string }> }
+    assert.equal(JSON.parse(adoptResult.content[0]!.text).adopted, true)
 
     const task = await request('tools/call', {
       name: 'task_create',

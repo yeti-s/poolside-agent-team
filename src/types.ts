@@ -8,6 +8,8 @@ export type MemberStatus =
   | 'stopped'
   | 'failed'
 
+export type MemberTerminationReason = 'completed' | 'shutdown_requested' | 'error' | 'unknown'
+
 export interface TeamMember {
   name: string
   role: 'leader' | 'teammate'
@@ -21,6 +23,12 @@ export interface TeamMember {
   tmuxPaneId?: string
   exitCode?: number | null
   logPath?: string
+  /** Pool interactive-session ID, used by `pool --resume` after a worker restart. */
+  sessionId?: string
+  terminationReason?: MemberTerminationReason
+  lastError?: string
+  restartCount?: number
+  lastActivityAt?: string
 }
 export interface TeamTask {
   id: string

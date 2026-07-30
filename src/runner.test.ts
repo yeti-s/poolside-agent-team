@@ -3,7 +3,7 @@ import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import test from 'node:test'
-import { interruptTmuxPane, spawnPoolWorker } from './runner.js'
+import { interruptTmuxPane, sendPromptToTmuxPane, spawnPoolWorker } from './runner.js'
 import { TeamStore } from './store.js'
 
 async function waitFor(
@@ -24,6 +24,7 @@ test('starts interactive Pool workers in tiled panes of the team window', async 
   const receivedArgs = join(projectRoot, 'tmux-args.json')
   const previousCommand = process.env.POOL_AGENT_TEAM_TMUX_COMMAND
   const previousOutput = process.env.POOL_AGENT_TEAM_TEST_OUTPUT
+  const previousDiscoveryTimeout = process.env.POOL_AGENT_TEAM_SESSION_DISCOVERY_TIMEOUT_MS
   try {
     await writeFile(
       fakeTmux,
@@ -38,6 +39,7 @@ test('starts interactive Pool workers in tiled panes of the team window', async 
     await chmod(fakeTmux, 0o755)
     process.env.POOL_AGENT_TEAM_TMUX_COMMAND = fakeTmux
     process.env.POOL_AGENT_TEAM_TEST_OUTPUT = receivedArgs
+    process.env.POOL_AGENT_TEAM_SESSION_DISCOVERY_TIMEOUT_MS = '0'
 
     const store = new TeamStore(projectRoot)
     await store.create({
@@ -69,6 +71,7 @@ test('starts interactive Pool workers in tiled panes of the team window', async 
       store,
     )
     await interruptTmuxPane(spawned.tmuxPaneId)
+    await sendPromptToTmuxPane(spawned.tmuxPaneId, 'Continue with the assigned task.')
 
     const invocations = (await readFile(receivedArgs, 'utf8'))
       .trim()
@@ -83,6 +86,7 @@ test('starts interactive Pool workers in tiled panes of the team window', async 
     assert.ok(invocations.some(args => args.includes('select-layout') && args.includes('tiled')))
     assert.ok(invocations.some(args => args.includes('pipe-pane') && args.includes('%7')))
     assert.ok(invocations.some(args => args.includes('send-keys') && args.includes('Escape')))
+    assert.ok(invocations.some(args => args.includes('send-keys') && args.includes('-l') && args.includes('Continue with the assigned task.')))
     assert.equal(spawned.tmuxPaneId, '%7')
     assert.equal(secondSpawned.tmuxWindow, 'team')
     assert.equal((await store.read())?.members.find(member => member.name === 'tester')?.tmuxWindow, 'team')
@@ -109,6 +113,8 @@ test('starts interactive Pool workers in tiled panes of the team window', async 
     else process.env.POOL_AGENT_TEAM_TMUX_COMMAND = previousCommand
     if (previousOutput === undefined) delete process.env.POOL_AGENT_TEAM_TEST_OUTPUT
     else process.env.POOL_AGENT_TEAM_TEST_OUTPUT = previousOutput
+    if (previousDiscoveryTimeout === undefined) delete process.env.POOL_AGENT_TEAM_SESSION_DISCOVERY_TIMEOUT_MS
+    else process.env.POOL_AGENT_TEAM_SESSION_DISCOVERY_TIMEOUT_MS = previousDiscoveryTimeout
     await rm(projectRoot, { recursive: true, force: true })
   }
 })

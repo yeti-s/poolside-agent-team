@@ -19,6 +19,7 @@ import {
   isProcessAlive,
   isTmuxPaneAlive,
   killTeamTmuxSession,
+  sendPromptToTmuxPane,
   spawnPoolWorker,
   startTeamWatchdog,
   teamTmuxSessionName,
@@ -32,6 +33,7 @@ const server = new McpServer({ name: 'pool-agent-team', version: '0.1.0' })
 const nonEmpty = z.string().trim().min(1)
 const taskStatus = z.enum(TASK_STATUSES)
 const maxMembers = z.number().int().min(1).max(64)
+const recoveryMessage = z.string().trim().min(1).max(20_000)
 let heartbeatTimer: NodeJS.Timeout | undefined
 let leaderSessionForExit: string | undefined
 let cleanupInProgress = false
@@ -59,6 +61,52 @@ async function execute<T>(action: () => Promise<T>) {
 
 async function currentState() {
   return requireTeam(await store.read())
+}
+
+function buildMessagePrompt(from: string, message: string): string {
+  return [
+    `Coordination message from ${from}:`,
+    message,
+    'Acknowledge the instruction, check task_list and message_list, then continue only the relevant assigned work.',
+  ].join('\n')
+}
+
+async function resumeMember(name: string, message?: string) {
+  const state = await currentState()
+  const member = state.members.find(item => item.name === name)
+  if (!member || member.role !== 'teammate') throw new TeamError(`member "${name}" was not found`)
+  if (!member.prompt) throw new TeamError(`member "${name}" has no saved worker prompt and cannot be resumed`)
+  const unfinishedTasks = state.tasks
+    .filter(task => task.owner === name && task.status !== 'completed')
+    .map(task => `- [${task.id}] ${task.subject}: ${task.description}`)
+  const unreadMessages = state.messages
+    .filter(item => (item.to === name || item.to === '*') && !item.readAt)
+    .map(item => `- From ${item.from}: ${item.body}`)
+  const recoveryContext = [
+    'Recovery context. Do not assume prior terminal output is still available.',
+    unfinishedTasks.length ? `Unfinished assigned tasks:\n${unfinishedTasks.join('\n')}` : 'No unfinished task is currently assigned to you.',
+    unreadMessages.length ? `Unread team messages:\n${unreadMessages.join('\n')}` : 'No unread team messages were found.',
+    message ? `New message from the coordinator:\n${message}` : '',
+  ].filter(Boolean).join('\n\n')
+  const spawned = await spawnPoolWorker({
+    name: member.name,
+    prompt: member.prompt,
+    teamName: state.team.name,
+    tmuxSession: state.team.tmuxSession,
+    projectRoot,
+    agentName: member.agentName,
+    model: member.model,
+    replaceExisting: true,
+    resumeSessionId: member.sessionId,
+    recoveryMessage: recoveryContext,
+  }, store)
+  return {
+    tmux_pane_id: spawned.tmuxPaneId,
+    pid: spawned.pid,
+    resumed_session_id: spawned.sessionId,
+    used_saved_session: Boolean(member.sessionId),
+    fallback: member.sessionId ? 'fresh session if Pool resume exits with an error' : 'fresh session',
+  }
 }
 
 async function requireCaller(): Promise<string> {
@@ -179,6 +227,33 @@ server.tool('team_list', 'List the currently configured team and all members.', 
   }),
 )
 
+server.tool(
+  'team_adopt',
+  'Transfer team-lead ownership to this Pool session. Use after restarting the lead CLI so the previous lead process cannot clean up the tmux team on exit. Set force only when the recorded leader process is still alive.',
+  { force: z.boolean().optional().describe('Required to take over from a still-running recorded leader.') },
+  async ({ force }) =>
+    execute(async () => {
+      if (callerName() !== 'team-lead') throw new TeamError('only team-lead can adopt a team')
+      const state = await currentState()
+      const previousLeaderPid = state.team.leaderPid
+      if (previousLeaderPid && previousLeaderPid !== process.ppid && isProcessAlive(previousLeaderPid) && !force) {
+        throw new TeamError('the recorded team leader is still running; call team_adopt with force: true to transfer ownership')
+      }
+      await store.updateTeam(team => {
+        team.leaderPid = process.ppid
+        team.heartbeatAt = new Date().toISOString()
+      })
+      leaderSessionForExit = state.team.tmuxSession
+      startLeaderHeartbeat()
+      return {
+        adopted: true,
+        tmux_session: state.team.tmuxSession,
+        previous_leader_pid: previousLeaderPid,
+        leader_pid: process.ppid,
+      }
+    }),
+)
+
 server.tool('team_status', 'Show team member liveness, task counts, and unread messages.', {}, async () =>
   execute(async () => {
     const caller = await requireCaller()
@@ -189,7 +264,17 @@ server.tool('team_status', 'Show team member liveness, task counts, and unread m
         ? await isTmuxPaneAlive(member.tmuxPaneId)
         : member.alive,
     })))
-    return { ...status, members }
+    return {
+      ...status,
+      members: members.map(member => ({
+        ...member,
+        runtime_status: member.role === 'teammate' && !member.alive
+          ? member.terminationReason === 'shutdown_requested'
+            ? 'shutdown_requested'
+            : 'recoverable'
+          : 'live',
+      })),
+    }
   }),
 )
 
@@ -287,14 +372,56 @@ server.tool(
 
 server.tool(
   'message_send',
-  'Send a text message to a teammate by name, or use * for all teammates.',
+  'Send a text message to a teammate by name, or use * for all teammates. Live teammates receive an interactive follow-up prompt. Recoverable stopped or failed teammates are automatically resumed before delivery; a shutdown-requested teammate is only queued.',
   { to: nonEmpty, message: nonEmpty },
   async ({ to, message }) =>
     execute(async () => {
       const from = await requireCaller()
       const state = await currentState()
       if (to !== '*') assertMember(state, to)
-      return store.addMessage({ from, to, body: message })
+      const stored = await store.addMessage({ from, to, body: message })
+      const recipients = state.members.filter(member =>
+        member.role === 'teammate' && (to === '*' || member.name === to),
+      )
+      const deliveries = await Promise.all(recipients.map(async member => {
+        const alive = member.tmuxPaneId ? await isTmuxPaneAlive(member.tmuxPaneId) : false
+        if (alive && member.tmuxPaneId) {
+          await sendPromptToTmuxPane(member.tmuxPaneId, buildMessagePrompt(from, message))
+          await store.updateMember(member.name, current => {
+            current.lastActivityAt = new Date().toISOString()
+          })
+          return { name: member.name, status: 'delivered' as const }
+        }
+        if (member.terminationReason === 'shutdown_requested' || member.status === 'shutdown_requested') {
+          return { name: member.name, status: 'queued_shutdown_requested' as const }
+        }
+        if (from !== 'team-lead') {
+          return { name: member.name, status: 'queued_requires_lead_recovery' as const }
+        }
+        const resumed = await resumeMember(member.name, message)
+        return { name: member.name, status: 'resumed_and_delivered' as const, ...resumed }
+      }))
+      return { message: stored, deliveries }
+    }),
+)
+
+server.tool(
+  'team_resume',
+  'Restart a stopped, failed, or dead-pane teammate. Restores its saved Pool session when possible, otherwise creates a fresh session with its role, unfinished tasks, unread messages, and an optional recovery instruction.',
+  { name: nonEmpty, message: recoveryMessage.optional() },
+  async ({ name, message }) =>
+    execute(async () => {
+      await requireLead()
+      const memberName = validateMemberName(name)
+      if (memberName === 'team-lead') throw new TeamError('team-lead cannot be resumed')
+      const state = await currentState()
+      const member = state.members.find(item => item.name === memberName)
+      if (!member) throw new TeamError(`member "${memberName}" was not found`)
+      if (member.tmuxPaneId && await isTmuxPaneAlive(member.tmuxPaneId)) {
+        if (message) await sendPromptToTmuxPane(member.tmuxPaneId, buildMessagePrompt('team-lead', message))
+        return { name: memberName, resumed: false, already_running: true, message_delivered: Boolean(message) }
+      }
+      return { name: memberName, resumed: true, ...(await resumeMember(memberName, message)) }
     }),
 )
 

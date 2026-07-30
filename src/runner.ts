@@ -1,5 +1,5 @@
 import { execFile, spawn } from 'node:child_process'
-import { mkdir, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
@@ -17,19 +17,31 @@ export interface SpawnWorkerInput {
   projectRoot: string
   agentName?: string
   model?: string
+  /** Restart an existing member instead of adding a new one. */
+  replaceExisting?: boolean
+  /** Prefer restoring this interactive Pool session. */
+  resumeSessionId?: string
+  /** A coordination message to queue immediately after startup or resume. */
+  recoveryMessage?: string
 }
 export interface SpawnedWorker {
   pid: number
   logPath: string
   tmuxWindow: string
   tmuxPaneId: string
+  sessionId?: string
 }
 
 type WorkerConfig = SpawnWorkerInput & {
   poolCommand: string
   poolArgs: string[]
   logPath: string
+  knownSessionIds: string[]
+  sessionIdPath: string
+  fallbackPoolArgs?: string[]
 }
+
+let workerLaunchQueue: Promise<void> = Promise.resolve()
 
 function tmuxCommand(): string {
   return process.env.POOL_AGENT_TEAM_TMUX_COMMAND || 'tmux'
@@ -101,6 +113,18 @@ export async function spawnPoolWorker(
   input: SpawnWorkerInput,
   store: TeamStore,
 ): Promise<SpawnedWorker> {
+  const launch = workerLaunchQueue.then(() => spawnPoolWorkerSerial(input, store))
+  // Pool only exposes an interactive session ID through local history.  Keep the
+  // bootstrap window serial so that a new history entry can be mapped to its
+  // teammate reliably.
+  workerLaunchQueue = launch.then(() => undefined, () => undefined)
+  return launch
+}
+
+async function spawnPoolWorkerSerial(
+  input: SpawnWorkerInput,
+  store: TeamStore,
+): Promise<SpawnedWorker> {
   const teamDirectory = join(input.projectRoot, '.poolside', 'agent-team')
   const runDirectory = join(teamDirectory, 'run')
   const logsDirectory = join(teamDirectory, 'logs')
@@ -108,23 +132,46 @@ export async function spawnPoolWorker(
 
   const logPath = join(logsDirectory, `${input.name}.log`)
   const configPath = join(runDirectory, `${input.name}.json`)
+  const sessionIdPath = join(runDirectory, `${input.name}.session.json`)
   const workerEntrypoint = fileURLToPath(new URL('./worker.js', import.meta.url))
   const poolCommand = process.env.POOL_AGENT_TEAM_POOL_COMMAND || 'pool'
-  const poolArgs = [
+  const basePoolArgs = [
     '--directory',
     input.projectRoot,
     '--mode',
     'always-allow',
     '--prompt-queue',
-    buildWorkerPrompt(input),
+    buildWorkerPrompt({ ...input, resumeSessionId: undefined }),
   ]
-  if (input.model) poolArgs.push('--model', input.model)
-  const config: WorkerConfig = { ...input, poolCommand, poolArgs, logPath }
+  if (input.recoveryMessage) basePoolArgs.push('--prompt-queue', buildRecoveryPrompt(input.recoveryMessage))
+  if (input.model) basePoolArgs.push('--model', input.model)
+  const poolArgs = input.resumeSessionId
+    ? ['--resume', input.resumeSessionId, ...basePoolArgs.slice(0, 4), ...basePoolArgs.slice(4)]
+    : basePoolArgs
+  const config: WorkerConfig = {
+    ...input,
+    poolCommand,
+    poolArgs,
+    logPath,
+    knownSessionIds: input.resumeSessionId ? [] : await recentPoolSessionIds(input.projectRoot, poolCommand),
+    sessionIdPath,
+    fallbackPoolArgs: input.resumeSessionId ? basePoolArgs : undefined,
+  }
+  await rm(sessionIdPath, { force: true })
   await writeFile(configPath, `${JSON.stringify(config)}\n`, { mode: 0o600 })
 
   const teamWindowTarget = `${input.tmuxSession}:${TEAM_WINDOW}`
   const command = `exec ${shellQuote(process.execPath)} ${shellQuote(workerEntrypoint)} ${shellQuote(configPath)}`
-  const hasTeammates = (await store.read())?.members.some(member => member.role === 'teammate') ?? false
+  const existingMember = (await store.read())?.members.find(member => member.name === input.name)
+  if (existingMember && !input.replaceExisting) {
+    throw new Error(`teammate "${input.name}" already exists`)
+  }
+  if (input.replaceExisting && existingMember?.tmuxPaneId) {
+    await killTmuxPaneIfPresent(existingMember.tmuxPaneId)
+  }
+  const hasTeammates = (await store.read())?.members.some(
+    member => member.role === 'teammate' && member.name !== input.name,
+  ) ?? false
   const paneResult = await tmux([
     hasTeammates ? 'split-window' : 'new-window',
     '-d',
@@ -151,8 +198,31 @@ export async function spawnPoolWorker(
     tmuxWindow: TEAM_WINDOW,
     tmuxPaneId,
   }
-  await store.addMember(makeMember(input, spawned))
-  return spawned
+  if (existingMember) {
+    await store.updateMember(input.name, member => {
+      Object.assign(member, {
+        ...makeMember(input, spawned),
+        joinedAt: member.joinedAt,
+        restartCount: (member.restartCount ?? 0) + 1,
+        sessionId: input.resumeSessionId ?? member.sessionId,
+        terminationReason: undefined,
+        lastError: undefined,
+        exitCode: undefined,
+        lastActivityAt: new Date().toISOString(),
+      })
+    })
+  } else {
+    await store.addMember(makeMember(input, spawned))
+  }
+
+  const sessionId = input.resumeSessionId ?? await waitForSessionId(sessionIdPath)
+  if (sessionId && !input.resumeSessionId) {
+    await store.updateMember(input.name, member => {
+      member.sessionId = sessionId
+      member.lastActivityAt = new Date().toISOString()
+    })
+  }
+  return { ...spawned, sessionId }
 }
 
 export async function killTeamTmuxSession(session: string): Promise<void> {
@@ -176,6 +246,23 @@ export async function interruptTmuxPane(paneId: string): Promise<void> {
     throw new Error(`teammate pane "${paneId}" is not running`)
   }
   await tmux(['send-keys', '-t', paneId, 'Escape'])
+}
+
+export async function sendPromptToTmuxPane(paneId: string, prompt: string): Promise<void> {
+  if (!(await isTmuxPaneAlive(paneId))) {
+    throw new Error(`teammate pane "${paneId}" is not running`)
+  }
+  // -l prevents tmux from interpreting message content as key names.
+  await tmux(['send-keys', '-t', paneId, '-l', prompt])
+  await tmux(['send-keys', '-t', paneId, 'Enter'])
+}
+
+async function killTmuxPaneIfPresent(paneId: string): Promise<void> {
+  try {
+    await tmux(['kill-pane', '-t', paneId])
+  } catch {
+    // A dead pane may already have disappeared with the team window.
+  }
 }
 
 export function isProcessAlive(pid: number): boolean {
@@ -216,6 +303,15 @@ function buildWorkerPrompt(input: SpawnWorkerInput): string {
   ].join('\n')
 }
 
+function buildRecoveryPrompt(message: string): string {
+  return [
+    'System recovery notice: the team coordinator restarted or reactivated this teammate.',
+    'Read task_list and message_list before taking action. Do not repeat already-completed work.',
+    'New coordination message:',
+    message,
+  ].join('\n')
+}
+
 function makeMember(input: SpawnWorkerInput, spawned: SpawnedWorker): TeamMember {
   return {
     name: input.name,
@@ -229,7 +325,41 @@ function makeMember(input: SpawnWorkerInput, spawned: SpawnedWorker): TeamMember
     logPath: spawned.logPath,
     tmuxWindow: spawned.tmuxWindow,
     tmuxPaneId: spawned.tmuxPaneId,
+    restartCount: 0,
+    lastActivityAt: new Date().toISOString(),
   }
+}
+
+async function recentPoolSessionIds(projectRoot: string, poolCommand: string): Promise<string[]> {
+  try {
+    const result = await execFileAsync(poolCommand, ['history', 'sessions'], {
+      cwd: projectRoot,
+      encoding: 'utf8',
+    })
+    return result.stdout
+      .split('\n')
+      .map(line => line.trim().split(/\s+/)[2])
+      .filter((id): id is string => Boolean(id && /^[0-9a-f-]{16,}$/i.test(id)))
+  } catch {
+    return []
+  }
+}
+
+async function waitForSessionId(sessionIdPath: string, timeoutMs = 30_000): Promise<string | undefined> {
+  const configuredTimeout = Number(process.env.POOL_AGENT_TEAM_SESSION_DISCOVERY_TIMEOUT_MS)
+  if (Number.isFinite(configuredTimeout) && configuredTimeout >= 0) timeoutMs = configuredTimeout
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    try {
+      const raw = JSON.parse(await readFile(sessionIdPath, 'utf8')) as { sessionId?: string; complete?: boolean }
+      if (raw.sessionId) return raw.sessionId
+      if (raw.complete) return undefined
+    } catch {
+      // The worker has not created its discovery result yet.
+    }
+    await new Promise(resolve => setTimeout(resolve, 250))
+  }
+  return undefined
 }
 
 function shellQuote(value: string): string {
