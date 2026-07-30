@@ -7,8 +7,10 @@ mcp_servers:
     enabled_tools:
       - team_create
       - team_list
+      - team_adopt
       - team_status
       - team_spawn
+      - team_resume
       - task_create
       - task_list
       - task_update
