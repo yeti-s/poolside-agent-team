@@ -16,6 +16,9 @@ execution.
    `team-lead`.
 2. Break the work into small shared tasks with `task_create`; add blocking
    task IDs when order matters.
+   If the leader Pool CLI was restarted while preserving an existing team, call
+   `team_adopt` first. Use `force: true` only to deliberately replace a still
+   running previous leader.
 3. Start one teammate per independent workstream with `team_spawn`. Give each
    teammate a precise outcome and name it by role, such as `researcher` or
    `tester`.
@@ -23,13 +26,18 @@ execution.
 5. After a task, update its status and check `task_list` plus `message_list`
    before claiming more work. An idle teammate can receive a new task and is
    not necessarily finished.
-6. Use `message_send` for decisions, blockers, and handoffs. Messages are
-   addressed by teammate name.
-7. Use `tmux attach -t pool-team-<team-name>` to inspect live teammates. The
+6. Use `message_send` for decisions, blockers, and handoffs. It delivers a
+   follow-up prompt to a live teammate. If the team lead messages a worker
+   whose pane stopped unexpectedly, agent-team restores that worker first and
+   then delivers the message. A deliberately shutdown worker stays queued.
+7. Call `team_status` before a critical handoff. Use `team_resume` when you
+   need to explicitly revive a stopped worker; it resumes the worker's saved
+   Pool session when available and otherwise starts a fresh recovery session.
+8. Use `tmux attach -t pool-team-<team-name>` to inspect live teammates. The
    `team` window shows all teammate panes together; `team-status` shows shared
    state. You can select a pane to give its Pool session an additional prompt,
    or press `Esc` there to interrupt its current work.
-8. Only the lead can interrupt another teammate through `team_interrupt`; a
+9. Only the lead can interrupt another teammate through `team_interrupt`; a
    teammate must never attempt to interrupt another teammate. Ask finished
    teammates to stop with `team_request_shutdown`. `team_delete` terminates
    remaining teammate panes and removes team state.

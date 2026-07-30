@@ -9,7 +9,8 @@ Poolside Agent Team is a local MCP server for coordinating multiple Pool CLI age
 - **Parallel teammate execution** — Only the leader can call `team_spawn`. Each teammate runs as an independent interactive `pool` session in the shared workspace, starting with its assigned prompt queued.
 - **Single-screen tmux view** — Every team receives a `pool-team-<team-name>` tmux session. The `team` window tiles all teammate panes together, while `team-status` displays shared state.
 - **Shared task coordination** — Teammates share tasks, ownership, dependencies, and completion state. Finished or failed teammates free a slot for a replacement.
-- **Direct messaging** — Team members exchange progress updates, questions, and blockers by teammate name.
+- **Recoverable teammates** — Each worker records its Pool session ID when available. A stopped worker can resume that session; if it cannot, the team starts a fresh recovery session with its role, outstanding tasks, and unread messages.
+- **Direct messaging** — Team members exchange progress updates, questions, and blockers by teammate name. A lead message automatically revives an unexpectedly stopped teammate before delivery; deliberately shutdown teammates remain queued.
 - **User and leader intervention** — Attach to a teammate pane to give its Pool session more instructions or press `Esc` to interrupt its current work. The leader can use `team_interrupt` to interrupt one teammate remotely; teammates cannot interrupt one another.
 - **Automatic cleanup** — `team_delete` terminates remaining teammate panes and removes team state. When the leader Pool CLI exits, the tmux session and all teammate work stop as well. A watchdog handles unexpected leader termination.
 
@@ -55,7 +56,9 @@ The `team` window displays every live teammate in a tiled pane. Select a pane to
 | --- | --- |
 | `team_create` | Create a team and configure `max_members` |
 | `team_list`, `team_status` | Inspect members, tmux identifiers, task summary, and messages |
+| `team_adopt` | Transfer team-lead ownership to a restarted Pool CLI session |
 | `team_spawn` | Start an interactive teammate in a pane of the tmux `team` window |
+| `team_resume` | Explicitly restart a stopped or failed teammate, preferring its saved Pool session |
 | `task_create`, `task_list`, `task_update` | Create, view, assign, and complete shared tasks |
 | `message_send`, `message_list` | Send and read teammate messages |
 | `team_interrupt` | Leader-only: interrupt a teammate's current task without closing its Pool session |
@@ -67,5 +70,18 @@ The `team` window displays every live teammate in a tiled pane. Select a pane to
 - Team state: `.poolside/agent-team/state.json`
 - Teammate logs: `.poolside/agent-team/logs/`
 - tmux launch scripts: `.poolside/agent-team/run/`
+- Worker state includes the last Pool session ID, restart count, termination reason, and last error when available.
+
+When Pool's model server disconnects, a pane can remain open at the interactive
+prompt even though its prior turn failed. `team_status` reports pane liveness;
+send the worker a follow-up with `message_send`, or use `team_resume` when its
+pane has exited. `message_send` is not merely a mailbox: when sent by the lead
+to a recoverable stopped worker, it restarts the worker and queues the message.
+`team_request_shutdown` opts a worker out of this automatic restart behavior.
+
+To upgrade or restart a lead Pool CLI without destroying a live team, open the
+replacement Pool CLI first and call `team_adopt` (use `force: true` only when
+the original leader is still alive). The old lead then no longer owns cleanup
+of the tmux session.
 
 Teammates run as `pool --mode always-allow` interactive sessions. They can edit files and execute commands without per-action approval, so use this only in trusted projects. All teammates share one workspace; split work to avoid editing the same files concurrently.
