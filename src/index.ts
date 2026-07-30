@@ -15,6 +15,7 @@ import {
 import {
   assertTmuxAvailable,
   createTeamTmuxSession,
+  interruptTmuxPane,
   isProcessAlive,
   isTmuxPaneAlive,
   killTeamTmuxSession,
@@ -194,12 +195,12 @@ server.tool('team_status', 'Show team member liveness, task counts, and unread m
 
 server.tool(
   'team_spawn',
-  'Start a non-interactive pool exec teammate in the shared project workspace.',
+  'Start an interactive Pool teammate in a pane of the shared tmux team window.',
   {
     name: nonEmpty.describe('Unique teammate name, such as researcher or tester.'),
     prompt: nonEmpty.describe('Concrete outcome and scope for the teammate.'),
-    agent_name: nonEmpty.optional().describe('Optional Pool managed-agent name.'),
-    model: nonEmpty.optional().describe('Optional model label recorded for the teammate.'),
+    agent_name: nonEmpty.optional().describe('Optional teammate metadata; interactive Pool does not use it to select an agent.'),
+    model: nonEmpty.optional().describe('Optional Pool model for the interactive teammate session.'),
   },
   async ({ name, prompt, agent_name, model }) =>
     execute(async () => {
@@ -305,6 +306,23 @@ server.tool(
 )
 
 server.tool(
+  'team_interrupt',
+  'Interrupt the current Pool task for a teammate while keeping its interactive session open. Only team-lead can call this.',
+  { name: nonEmpty },
+  async ({ name }) =>
+    execute(async () => {
+      await requireLead()
+      const state = await currentState()
+      const memberName = validateMemberName(name)
+      if (memberName === 'team-lead') throw new TeamError('team-lead cannot interrupt itself')
+      const member = state.members.find(item => item.name === memberName)
+      if (!member?.tmuxPaneId) throw new TeamError(`member "${memberName}" has no running tmux pane`)
+      await interruptTmuxPane(member.tmuxPaneId)
+      return { name: memberName, interrupted: true, tmux_pane_id: member.tmuxPaneId }
+    }),
+)
+
+server.tool(
   'team_request_shutdown',
   'Request that a teammate finish safely and exit. This is cooperative and does not kill the process.',
   { name: nonEmpty },
@@ -327,7 +345,7 @@ server.tool(
 
 server.tool(
   'team_delete',
-  'Terminate all teammate windows and delete the team state.',
+  'Terminate all teammate panes and delete the team state.',
   {},
   async () =>
     execute(async () => {
