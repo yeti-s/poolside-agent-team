@@ -14,5 +14,6 @@ mcp_servers:
       - task_update
       - message_send
       - message_list
+      - team_interrupt
       - team_request_shutdown
       - team_delete

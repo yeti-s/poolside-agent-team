@@ -25,10 +25,14 @@ execution.
    not necessarily finished.
 6. Use `message_send` for decisions, blockers, and handoffs. Messages are
    addressed by teammate name.
-7. Use `tmux attach -t pool-team-<team-name>` to inspect live teammate windows;
-   `team-status` shows the shared state and each teammate has a named window.
-8. Ask finished teammates to stop with `team_request_shutdown`. `team_delete`
-   terminates remaining teammate windows and removes team state.
+7. Use `tmux attach -t pool-team-<team-name>` to inspect live teammates. The
+   `team` window shows all teammate panes together; `team-status` shows shared
+   state. You can select a pane to give its Pool session an additional prompt,
+   or press `Esc` there to interrupt its current work.
+8. Only the lead can interrupt another teammate through `team_interrupt`; a
+   teammate must never attempt to interrupt another teammate. Ask finished
+   teammates to stop with `team_request_shutdown`. `team_delete` terminates
+   remaining teammate panes and removes team state.
 
 ## Safety and ownership
 
@@ -36,9 +40,9 @@ execution.
   not call `team_spawn` or `team_delete`.
 - Keep tasks narrow enough that two teammates do not edit the same files at the
   same time. This implementation uses one shared workspace, not Git worktrees.
-- Workers run non-interactively with automatic approval. Only create a team in
-  a trusted project and never ask a teammate to expose credentials or modify
-  systems outside the requested work.
+- Workers run as interactive Pool sessions in Always Allow mode. Only create a
+  team in a trusted project and never ask a teammate to expose credentials or
+  modify systems outside the requested work.
 - A shutdown request is cooperative: finish or safely stop current work, read
   the shutdown message, then exit. The leader Pool CLI owns the tmux session;
   exiting the leader CLI terminates every teammate window automatically.

@@ -1,12 +1,13 @@
 import { execFile, spawn } from 'node:child_process'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
-import { dirname, join } from 'node:path'
+import { join } from 'node:path'
 import { promisify } from 'node:util'
 import type { TeamStore } from './store.js'
 import type { TeamMember } from './types.js'
 
 const execFileAsync = promisify(execFile)
+const TEAM_WINDOW = 'team'
 
 export interface SpawnWorkerInput {
   name: string
@@ -110,41 +111,44 @@ export async function spawnPoolWorker(
   const workerEntrypoint = fileURLToPath(new URL('./worker.js', import.meta.url))
   const poolCommand = process.env.POOL_AGENT_TEAM_POOL_COMMAND || 'pool'
   const poolArgs = [
-    'exec',
     '--directory',
     input.projectRoot,
-    '--unsafe-auto-allow',
-    '--output',
-    'json',
-    '--prompt',
+    '--mode',
+    'always-allow',
+    '--prompt-queue',
     buildWorkerPrompt(input),
   ]
-  if (input.agentName) poolArgs.push('--agent-name', input.agentName)
+  if (input.model) poolArgs.push('--model', input.model)
   const config: WorkerConfig = { ...input, poolCommand, poolArgs, logPath }
   await writeFile(configPath, `${JSON.stringify(config)}\n`, { mode: 0o600 })
 
+  const teamWindowTarget = `${input.tmuxSession}:${TEAM_WINDOW}`
+  const command = `exec ${shellQuote(process.execPath)} ${shellQuote(workerEntrypoint)} ${shellQuote(configPath)}`
+  const hasTeammates = (await store.read())?.members.some(member => member.role === 'teammate') ?? false
   const paneResult = await tmux([
-    'new-window',
+    hasTeammates ? 'split-window' : 'new-window',
     '-d',
     '-P',
     '-F',
     '#{pane_id}:#{pane_pid}',
     '-t',
-    input.tmuxSession,
-    '-n',
-    input.name,
-    `exec ${shellQuote(process.execPath)} ${shellQuote(workerEntrypoint)} ${shellQuote(configPath)}`,
+    hasTeammates ? teamWindowTarget : input.tmuxSession,
+    ...(hasTeammates ? [] : ['-n', TEAM_WINDOW]),
+    command,
   ])
   const [tmuxPaneId, rawPid] = paneResult.split(':')
   const pid = Number(rawPid)
   if (!tmuxPaneId || !Number.isInteger(pid) || pid <= 0) {
     throw new Error(`tmux did not return a pane ID and PID: ${paneResult}`)
   }
+  await tmux(['select-layout', '-t', teamWindowTarget, 'tiled'])
+  await tmux(['pipe-pane', '-o', '-t', tmuxPaneId, `cat >> ${shellQuote(logPath)}`])
+  await tmux(['select-window', '-t', teamWindowTarget])
 
   const spawned: SpawnedWorker = {
     pid,
     logPath,
-    tmuxWindow: input.name,
+    tmuxWindow: TEAM_WINDOW,
     tmuxPaneId,
   }
   await store.addMember(makeMember(input, spawned))
@@ -157,11 +161,21 @@ export async function killTeamTmuxSession(session: string): Promise<void> {
 
 export async function isTmuxPaneAlive(paneId: string): Promise<boolean> {
   try {
-    const panes = await tmux(['list-panes', '-a', '-F', '#{pane_id}'])
-    return panes.split('\n').includes(paneId)
+    const panes = await tmux(['list-panes', '-a', '-F', '#{pane_id}:#{pane_dead}'])
+    return panes.split('\n').some(pane => {
+      const [id, dead] = pane.split(':')
+      return id === paneId && dead !== '1'
+    })
   } catch {
     return false
   }
+}
+
+export async function interruptTmuxPane(paneId: string): Promise<void> {
+  if (!(await isTmuxPaneAlive(paneId))) {
+    throw new Error(`teammate pane "${paneId}" is not running`)
+  }
+  await tmux(['send-keys', '-t', paneId, 'Escape'])
 }
 
 export function isProcessAlive(pid: number): boolean {

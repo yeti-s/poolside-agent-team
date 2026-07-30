@@ -3,7 +3,7 @@ import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import test from 'node:test'
-import { spawnPoolWorker } from './runner.js'
+import { interruptTmuxPane, spawnPoolWorker } from './runner.js'
 import { TeamStore } from './store.js'
 
 async function waitFor(
@@ -18,7 +18,7 @@ async function waitFor(
   throw new Error('condition did not become true before timeout')
 }
 
-test('starts a pool worker in a named tmux window', async () => {
+test('starts interactive Pool workers in tiled panes of the team window', async () => {
   const projectRoot = await mkdtemp(join(tmpdir(), 'pool-agent-team-runner-'))
   const fakeTmux = join(projectRoot, 'fake-tmux.mjs')
   const receivedArgs = join(projectRoot, 'tmux-args.json')
@@ -29,9 +29,10 @@ test('starts a pool worker in a named tmux window', async () => {
       fakeTmux,
       [
         '#!/usr/bin/env node',
-        "import { writeFileSync } from 'node:fs';",
-        "writeFileSync(process.env.POOL_AGENT_TEAM_TEST_OUTPUT, JSON.stringify({ args: process.argv.slice(2) }));",
-        "if (process.argv.includes('new-window')) process.stdout.write('%7:999\\n');",
+        "import { appendFileSync } from 'node:fs';",
+        "appendFileSync(process.env.POOL_AGENT_TEAM_TEST_OUTPUT, `${JSON.stringify(process.argv.slice(2))}\\n`);",
+        "if (process.argv.includes('new-window') || process.argv.includes('split-window')) process.stdout.write('%7:999\\n');",
+        "if (process.argv.includes('list-panes')) process.stdout.write('%7:0\\n');",
       ].join('\n'),
     )
     await chmod(fakeTmux, 0o755)
@@ -52,17 +53,57 @@ test('starts a pool worker in a named tmux window', async () => {
         tmuxSession: 'pool-team-feature-x',
         prompt: 'Run the test suite.',
         projectRoot,
+        agentName: 'metadata-agent',
+        model: 'laguna-test',
       },
       store,
     )
+    const secondSpawned = await spawnPoolWorker(
+      {
+        name: 'reviewer',
+        teamName: 'feature-x',
+        tmuxSession: 'pool-team-feature-x',
+        prompt: 'Review the implementation.',
+        projectRoot,
+      },
+      store,
+    )
+    await interruptTmuxPane(spawned.tmuxPaneId)
 
-    const invocation = JSON.parse(await readFile(receivedArgs, 'utf8')) as {
-      args: string[]
-    }
-    assert.ok(invocation.args.includes('new-window'))
-    assert.ok(invocation.args.includes('pool-team-feature-x'))
+    const invocations = (await readFile(receivedArgs, 'utf8'))
+      .trim()
+      .split('\n')
+      .map(line => JSON.parse(line) as string[])
+    const launch = invocations.find(args => args.includes('new-window'))
+    const split = invocations.find(args => args.includes('split-window'))
+    assert.ok(launch)
+    assert.ok(split)
+    assert.ok(launch.includes('pool-team-feature-x'))
+    assert.ok(split.includes('pool-team-feature-x:team'))
+    assert.ok(invocations.some(args => args.includes('select-layout') && args.includes('tiled')))
+    assert.ok(invocations.some(args => args.includes('pipe-pane') && args.includes('%7')))
+    assert.ok(invocations.some(args => args.includes('send-keys') && args.includes('Escape')))
     assert.equal(spawned.tmuxPaneId, '%7')
-    assert.equal((await store.read())?.members.find(member => member.name === 'tester')?.tmuxWindow, 'tester')
+    assert.equal(secondSpawned.tmuxWindow, 'team')
+    assert.equal((await store.read())?.members.find(member => member.name === 'tester')?.tmuxWindow, 'team')
+
+    const config = JSON.parse(await readFile(join(projectRoot, '.poolside', 'agent-team', 'run', 'tester.json'), 'utf8')) as {
+      poolArgs: string[]
+      agentName?: string
+    }
+    assert.deepEqual(config.poolArgs.slice(0, 7), [
+      '--directory',
+      projectRoot,
+      '--mode',
+      'always-allow',
+      '--prompt-queue',
+      config.poolArgs[5]!,
+      '--model',
+    ])
+    assert.equal(config.poolArgs[7], 'laguna-test')
+    assert.ok(!config.poolArgs.includes('exec'))
+    assert.ok(!config.poolArgs.includes('--agent-name'))
+    assert.equal(config.agentName, 'metadata-agent')
   } finally {
     if (previousCommand === undefined) delete process.env.POOL_AGENT_TEAM_TMUX_COMMAND
     else process.env.POOL_AGENT_TEAM_TMUX_COMMAND = previousCommand

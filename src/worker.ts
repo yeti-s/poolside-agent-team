@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process'
-import { createWriteStream, readFileSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
 import { TeamStore } from './store.js'
 
 type WorkerConfig = {
@@ -16,7 +16,6 @@ type WorkerConfig = {
 const configPath = process.argv[2]
 if (!configPath) throw new Error('worker configuration path is required')
 const config = JSON.parse(readFileSync(configPath, 'utf8')) as WorkerConfig
-const log = createWriteStream(config.logPath, { flags: 'a' })
 const child = spawn(config.poolCommand, config.poolArgs, {
   cwd: config.projectRoot,
   env: {
@@ -26,12 +25,8 @@ const child = spawn(config.poolCommand, config.poolArgs, {
     POOL_AGENT_TEAM_PROJECT_ROOT: config.projectRoot,
     ...(config.model ? { POOL_AGENT_TEAM_MODEL: config.model } : {}),
   },
-  stdio: ['ignore', 'pipe', 'pipe'],
+  stdio: 'inherit',
 })
-child.stdout?.pipe(process.stdout)
-child.stdout?.pipe(log)
-child.stderr?.pipe(process.stderr)
-child.stderr?.pipe(log)
 
 let finished = false
 async function finish(code: number | null, signal?: string, startupError?: string): Promise<void> {
@@ -53,8 +48,6 @@ async function finish(code: number | null, signal?: string, startupError?: strin
     })
   } catch {
     // The lead may have deleted the team while this worker was exiting.
-  } finally {
-    log.end()
   }
   process.exitCode = code ?? 1
 }
@@ -62,6 +55,6 @@ async function finish(code: number | null, signal?: string, startupError?: strin
 child.once('exit', (code, signal) => void finish(code, signal ?? undefined))
 
 child.once('error', error => {
-  log.write(`Failed to start worker: ${error.message}\n`)
+  console.error(`Failed to start worker: ${error.message}`)
   void finish(null, undefined, error.message)
 })
