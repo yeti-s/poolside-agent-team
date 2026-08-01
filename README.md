@@ -75,13 +75,17 @@ The `team` window displays every live teammate in a tiled pane. Select a pane to
 When Pool's model server disconnects, a pane can remain open at the interactive
 prompt even though its prior turn failed. `team_status` reports pane liveness;
 send the worker a follow-up with `message_send`, or use `team_resume` when its
-pane has exited. `message_send` is not merely a mailbox: when sent by the lead
-to a recoverable stopped worker, it restarts the worker and queues the message.
-`team_request_shutdown` opts a worker out of this automatic restart behavior.
+pane has exited. A message from the lead is treated as a new explicit work
+instruction, including for a teammate whose earlier tasks are complete. The
+worker must report completion or a blocker through `message_send` rather than
+silently waiting at the Pool prompt. `message_send` is not merely a mailbox:
+when sent by the lead to a recoverable stopped worker, it restarts the worker
+and queues the message. `team_request_shutdown` opts a worker out of this
+automatic restart behavior.
 
 To upgrade or restart a lead Pool CLI without destroying a live team, open the
 replacement Pool CLI first and call `team_adopt` (use `force: true` only when
 the original leader is still alive). The old lead then no longer owns cleanup
-of the tmux session.
+of the tmux session, so it can exit safely.
 
 Teammates run as `pool --mode always-allow` interactive sessions. They can edit files and execute commands without per-action approval, so use this only in trusted projects. All teammates share one workspace; split work to avoid editing the same files concurrently.
