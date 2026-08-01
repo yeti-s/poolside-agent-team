@@ -1,6 +1,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { spawnSync } from 'node:child_process'
+import { readFileSync } from 'node:fs'
 import { z } from 'zod'
 import {
   DEFAULT_MAX_MEMBERS,
@@ -67,7 +68,10 @@ function buildMessagePrompt(from: string, message: string): string {
   return [
     `Coordination message from ${from}:`,
     message,
-    'Acknowledge the instruction, check task_list and message_list, then continue only the relevant assigned work.',
+    from === 'team-lead'
+      ? 'This is an explicit new work instruction from team-lead. Treat it as assigned work even if all existing tasks are completed or none is assigned to you. Do not merely wait or say that prior work is finished.'
+      : 'Check whether this coordination message affects your assigned work, then act on the relevant request.',
+    'Check task_list and message_list, perform the requested work, then send a concise completion or blocker report back to the sender with message_send.',
   ].join('\n')
 }
 
@@ -149,6 +153,17 @@ async function cleanupLeaderTeam(): Promise<void> {
 
 function cleanStaleTeamSynchronously(): void {
   if (!leaderSessionForExit) return
+  // `team_adopt` may have handed ownership to a replacement Pool CLI.  The
+  // old MCP process still receives an exit event, so verify ownership again
+  // before it removes the shared tmux session.
+  try {
+    const state = JSON.parse(readFileSync(store.statePath, 'utf8')) as {
+      team?: { leaderPid?: number }
+    }
+    if (state.team?.leaderPid !== process.ppid) return
+  } catch {
+    return
+  }
   spawnSync(process.env.POOL_AGENT_TEAM_TMUX_COMMAND || 'tmux', [
     'kill-session',
     '-t',
@@ -372,7 +387,7 @@ server.tool(
 
 server.tool(
   'message_send',
-  'Send a text message to a teammate by name, or use * for all teammates. Live teammates receive an interactive follow-up prompt. Recoverable stopped or failed teammates are automatically resumed before delivery; a shutdown-requested teammate is only queued.',
+  'Send a text message to a teammate by name, or use * for all teammates. A message from team-lead is an explicit work instruction even if the recipient previously completed its tasks. Live teammates receive an interactive follow-up prompt. Recoverable stopped or failed teammates are automatically resumed before delivery; a shutdown-requested teammate is only queued.',
   { to: nonEmpty, message: nonEmpty },
   async ({ to, message }) =>
     execute(async () => {

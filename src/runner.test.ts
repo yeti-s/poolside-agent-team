@@ -108,6 +108,8 @@ test('starts interactive Pool workers in tiled panes of the team window', async 
     assert.ok(!config.poolArgs.includes('exec'))
     assert.ok(!config.poolArgs.includes('--agent-name'))
     assert.equal(config.agentName, 'metadata-agent')
+    assert.match(config.poolArgs[5]!, /direct coordination message from team-lead is an explicit task assignment/)
+    assert.match(config.poolArgs[5]!, /Only leave the team after an explicit shutdown request/)
   } finally {
     if (previousCommand === undefined) delete process.env.POOL_AGENT_TEAM_TMUX_COMMAND
     else process.env.POOL_AGENT_TEAM_TMUX_COMMAND = previousCommand
