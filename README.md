@@ -2,6 +2,10 @@
 
 Poolside Agent Team is a local MCP server for coordinating multiple Pool CLI agents as one team. A leader creates the team and shared tasks; teammates run as interactive `pool` sessions in tmux panes.
 
+![Four teammates collaborating through direct messages in tmux](assets/team-collaboration.gif)
+
+This demo runs [Pool](https://github.com/poolsideai/pool) on an NVIDIA DGX Spark with `Qwen/Qwen3.6-35B-A3B-FP8`, showing four teammates coordinating in English through direct messages.
+
 ## Features
 
 - **Team creation and leadership** — The current `pool` session becomes `team-lead`. Only one active team is allowed per project.
