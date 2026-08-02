@@ -26,6 +26,8 @@ export interface SpawnWorkerInput {
   resumeSessionId?: string
   /** A coordination message to queue immediately after startup or resume. */
   recoveryMessage?: string
+  /** Return after the pane and member record are ready; discovery continues in the worker. */
+  waitForSessionId?: boolean
 }
 export interface SpawnedWorker {
   pid: number
@@ -223,7 +225,9 @@ async function spawnPoolWorkerSerial(
     await store.addMember(makeMember(input, spawned))
   }
 
-  const sessionId = input.resumeSessionId ?? await waitForSessionId(sessionIdPath)
+  const sessionId = input.resumeSessionId ?? (input.waitForSessionId === false
+    ? undefined
+    : await waitForSessionId(sessionIdPath))
   if (sessionId && !input.resumeSessionId) {
     await store.updateMember(input.name, member => {
       member.sessionId = sessionId

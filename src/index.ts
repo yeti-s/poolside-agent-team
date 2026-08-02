@@ -112,7 +112,9 @@ function buildMessagePrompt(from: string, message: string, kind: MessageKind, fr
     fromTeamLead
       ? 'This is an explicit new work instruction from team-lead. Treat it as assigned work even if all existing tasks are completed or none is assigned to you. Do not merely wait or say that prior work is finished.'
       : `This ${kind} message requires a response. Check whether it affects your assigned work, then act on the relevant request.`,
-    'Check task_list and message_list, perform the requested work, then send a concise completion or blocker report back to the sender with message_send.',
+    from === 'system'
+      ? 'Check task_list and message_list, perform the requested coordination, then update tasks or notify the affected teammate. Do not reply to system.'
+      : 'Check task_list and message_list, perform the requested work, then send a concise completion or blocker report back to the sender with message_send.',
   ].join('\n')
 }
 
@@ -122,6 +124,37 @@ function buildTaskAssignmentMessage(task: { id: string, subject: string, descrip
     task.description,
     'Start with the smallest concrete step. Call task_update to mark the task in_progress and include a progress_note for each material result or blocker.',
   ].join('\n\n')
+}
+
+function buildStandaloneLeaderPrompt(description?: string): string {
+  return [
+    'Coordinate this team autonomously after the creating Pool session has created its initial members and tasks.',
+    description ? `Team objective: ${description}` : '',
+    'Whenever a teammate reports completion, blocker, handoff, or review result, immediately read message_list and task_list.',
+    'Turn each result into an explicit next task, validation task, review task, or a concise final outcome. Assign every task to a named teammate and use depends_on for prerequisites.',
+    'Do not leave teammates waiting after a completion report. Before declaring the team finished, confirm that every task is completed and that all completion/report messages have been handled.',
+    'Do not create teammates unless the creating lead explicitly requests it; coordinate the members already present.',
+  ].filter(Boolean).join('\n\n')
+}
+
+async function notifyLeaderOfTaskCompletion(task: { id: string, subject: string }, from: string) {
+  const state = await currentState()
+  if (from === state.team.lead) return { status: 'not_required' as const }
+  const leader = state.members.find(member => member.name === state.team.lead)
+  const message = await store.addMessage({
+    from: 'system',
+    to: state.team.lead,
+    kind: 'system',
+    body: `Task #${task.id} "${task.subject}" was marked completed by ${from}. Review the task result and pending teammate reports, then assign or communicate the next step.`,
+    requiresResponse: true,
+  })
+  const alive = leader?.tmuxPaneId ? await isTmuxPaneAlive(leader.tmuxPaneId) : false
+  if (!alive || !leader?.tmuxPaneId) return { status: 'recorded_no_live_leader' as const, message }
+  await sendPromptToTmuxPane(leader.tmuxPaneId, buildMessagePrompt('system', message.body, 'handoff'))
+  await store.updateMember(leader.name, member => {
+    member.lastActivityAt = new Date().toISOString()
+  })
+  return { status: 'delivered' as const, message }
 }
 
 async function deliverTaskAssignment(task: {
@@ -653,6 +686,18 @@ server.tool(
         await store.updateTeam(team => {
           team.watchdogPid = watchdogPid
         })
+        // The creating Pool session cannot receive asynchronous MCP prompts.
+        // Run the coordinating leader in tmux so teammate reports can wake it.
+        await spawnPoolWorker({
+          name: state.team.lead,
+          prompt: buildStandaloneLeaderPrompt(description),
+          teamName: state.team.name,
+          tmuxSession,
+          projectRoot,
+          role: 'leader',
+          replaceExisting: true,
+          waitForSessionId: false,
+        }, store)
       } catch (error) {
         await store.remove()
         throw error
@@ -845,7 +890,10 @@ server.tool(
       const unblocked_deliveries = task.status === 'completed' && before?.status !== 'completed'
         ? await deliverNewlyUnblockedTasks(task.id, from)
         : []
-      return { ...task, assignment_delivery, unblocked_deliveries }
+      const leader_completion_delivery = task.status === 'completed' && before?.status !== 'completed'
+        ? await notifyLeaderOfTaskCompletion(task, from)
+        : { status: 'not_required' as const }
+      return { ...task, assignment_delivery, unblocked_deliveries, leader_completion_delivery }
     }),
 )
 
@@ -864,7 +912,12 @@ server.tool(
       const state = await currentState()
       if (to !== '*') assertMember(state, to)
       const resolvedMessageKind = message_kind ?? 'task'
-      const responseRequired = requires_response ?? defaultRequiresResponse(resolvedMessageKind)
+      // Completion reports are sometimes incorrectly labelled FYI by a
+      // teammate. Reports addressed to the lead are orchestration events and
+      // must always wake a live autonomous leader pane.
+      const responseRequired = to === state.team.lead && from !== state.team.lead
+        ? true
+        : requires_response ?? defaultRequiresResponse(resolvedMessageKind)
       const stored = await store.addMessage({
         from,
         to,
@@ -873,7 +926,9 @@ server.tool(
         requiresResponse: responseRequired,
       })
       const recipients = state.members.filter(member =>
-        member.role === 'teammate' && (to === '*' || member.name === to),
+        (to === '*' || member.name === to)
+        && (member.role === 'teammate' || member.name === state.team.lead)
+        && member.name !== from,
       )
       if (!responseRequired) {
         return {

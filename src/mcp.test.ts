@@ -162,7 +162,8 @@ test('delivers owned tasks and exposes unassigned tasks separately from live wor
       "appendFileSync(process.env.POOL_AGENT_TEAM_TEST_TMUX_LOG, `${JSON.stringify(process.argv.slice(2))}\\n`);",
       "if (process.argv.includes('-V')) process.stdout.write('tmux 3.2a\\n');",
       "if (process.argv.includes('has-session')) process.exit(1);",
-      "if (process.argv.includes('list-panes')) process.stdout.write('%worker:0\\n');",
+      "if (process.argv.includes('new-window') || process.argv.includes('split-window')) process.stdout.write('%leader:999\\n');",
+      "if (process.argv.includes('list-panes')) process.stdout.write('%worker:0\\n%leader:0\\n');",
     ].join('\n'),
   )
   await chmod(fakeTmux, 0o755)
@@ -215,6 +216,7 @@ test('delivers owned tasks and exposes unassigned tasks separately from live wor
     assert.equal(createPayload.isError, undefined, createPayload.content[0]?.text)
     const statePath = join(projectRoot, '.poolside', 'agent-team', 'state.json')
     const state = JSON.parse(await readFile(statePath, 'utf8')) as { members: Array<Record<string, unknown>> }
+    assert.equal(state.members.find(member => member.name === 'team-lead')?.tmuxPaneId, '%leader')
     state.members.push({
       name: 'worker',
       role: 'teammate',
