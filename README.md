@@ -14,7 +14,7 @@ This demo runs [Pool](https://github.com/poolsideai/pool) on an NVIDIA DGX Spark
 - **Single-screen tmux view** — Every team receives a `pool-team-<team-name>` tmux session. The `team` window tiles all teammate panes together, while `team-status` displays shared state.
 - **Shared task coordination** — Teammates share tasks, ownership, dependencies, and completion state. Finished or failed teammates free a slot for a replacement.
 - **Recoverable teammates** — Each worker records its Pool session ID when available. A stopped worker can resume that session; if it cannot, the team starts a fresh recovery session with its role, outstanding tasks, and unread messages.
-- **Direct messaging** — Team members exchange progress updates, questions, and blockers by teammate name. A lead message automatically revives an unexpectedly stopped teammate before delivery; deliberately shutdown teammates remain queued.
+- **Direct messaging** — Team members exchange progress updates, questions, and blockers by teammate name. Use `message_kind: fyi` or `ack` for non-actionable information and acknowledgements; they are recorded without interrupting recipients. A response-required lead message automatically revives an unexpectedly stopped teammate before delivery; deliberately shutdown teammates remain queued.
 - **User and leader intervention** — Attach to a teammate pane to give its Pool session more instructions or press `Esc` to interrupt its current work. The leader can use `team_interrupt` to interrupt one teammate remotely; teammates cannot interrupt one another.
 - **Automatic cleanup** — `team_delete` terminates remaining teammate panes and removes team state. When the leader Pool CLI exits, the tmux session and all teammate work stop as well. A watchdog handles unexpected leader termination.
 
@@ -64,7 +64,7 @@ The `team` window displays every live teammate in a tiled pane. Select a pane to
 | `team_spawn` | Start an interactive teammate in a pane of the tmux `team` window |
 | `team_resume` | Explicitly restart a stopped or failed teammate, preferring its saved Pool session |
 | `task_create`, `task_list`, `task_update` | Create, view, assign, and complete shared tasks |
-| `message_send`, `message_list` | Send and read teammate messages |
+| `message_send`, `message_list` | Send and read teammate messages (`task`/`handoff`/`decision` prompt a response; `fyi`/`ack` do not) |
 | `team_interrupt` | Leader-only: interrupt a teammate's current task without closing its Pool session |
 | `team_request_shutdown` | Ask one teammate to shut down cooperatively |
 | `team_delete` | Stop all teammate panes and remove team resources |

@@ -26,10 +26,15 @@ execution.
 5. After a task, update its status and check `task_list` plus `message_list`
    before claiming more work. An idle teammate can receive a new task and is
    not necessarily finished.
-6. Use `message_send` for decisions, blockers, and handoffs. It delivers a
-   follow-up prompt to a live teammate. If the team lead messages a worker
-   whose pane stopped unexpectedly, agent-team restores that worker first and
-   then delivers the message. A deliberately shutdown worker stays queued.
+6. Use `message_send` with `message_kind: task`, `handoff`, or `decision` for
+   decisions, blockers, and handoffs; these deliver a follow-up prompt to a
+   live teammate. Use `message_kind: fyi` for information and `ack` for a
+   short acknowledgement: they are recorded for `message_list` but do not
+   interrupt or restart recipients, so never reply to a closing greeting with
+   another `message_send`. If the team lead sends a response-required message
+   to a worker whose pane stopped unexpectedly, agent-team restores that worker
+   first and then delivers the message. A deliberately shutdown worker stays
+   queued.
 7. Call `team_status` before a critical handoff. Use `team_resume` when you
    need to explicitly revive a stopped worker; it resumes the worker's saved
    Pool session when available and otherwise starts a fresh recovery session.

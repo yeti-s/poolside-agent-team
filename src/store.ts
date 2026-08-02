@@ -239,6 +239,8 @@ export class TeamStore {
     to: string
     body: string
     kind?: TeamMessage['kind']
+    messageKind?: TeamMessage['messageKind']
+    requiresResponse?: boolean
   }): Promise<TeamMessage> {
     let created!: TeamMessage
     await this.mutate(current => {
@@ -252,6 +254,8 @@ export class TeamStore {
         body: input.body.trim(),
         createdAt: new Date().toISOString(),
         kind: input.kind ?? 'message',
+        messageKind: input.messageKind,
+        requiresResponse: input.requiresResponse,
       }
       state.messages.push(created)
       return state
