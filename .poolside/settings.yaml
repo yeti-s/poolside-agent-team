@@ -5,6 +5,11 @@ mcp_servers:
       - dist/index.js
     cwd: .
     enabled_tools:
+      - organization_plan
+      - organization_approve
+      - organization_status
+      - organization_message_send
+      - organization_delete
       - team_create
       - team_list
       - team_adopt

@@ -67,6 +67,9 @@ test('serves agent-team tools through the MCP stdio protocol', async () => {
     assert.ok(names.includes('team_adopt'))
     assert.ok(names.includes('team_resume'))
     assert.ok(names.includes('team_interrupt'))
+    assert.ok(names.includes('organization_plan'))
+    assert.ok(names.includes('organization_approve'))
+    assert.ok(names.includes('organization_message_send'))
     const messageSend = (tools.result as { tools: Array<{ name: string, inputSchema: { properties?: Record<string, unknown> } }> }).tools
       .find(tool => tool.name === 'message_send')
     assert.ok(messageSend?.inputSchema.properties?.message_kind)
@@ -74,7 +77,7 @@ test('serves agent-team tools through the MCP stdio protocol', async () => {
 
     const create = await request('tools/call', {
       name: 'team_create',
-      arguments: { team_name: 'MCP Feature', description: 'MCP test team' },
+      arguments: { team_name: 'MCP Feature', description: 'MCP test team', leader_name: 'team-lead' },
     })
     const result = create.result as { content: Array<{ text: string }> }
     assert.equal(JSON.parse(result.content[0]!.text).team_name, 'mcp-feature')
@@ -98,6 +101,31 @@ test('serves agent-team tools through the MCP stdio protocol', async () => {
     const acknowledgementPayload = JSON.parse(acknowledgementResult.content[0]!.text)
     assert.equal(acknowledgementPayload.message.messageKind, 'ack')
     assert.equal(acknowledgementPayload.message.requiresResponse, false)
+
+    const organizationPlan = await request('tools/call', {
+      name: 'organization_plan',
+      arguments: {
+        organization_name: 'MCP Organization',
+        teams: [{
+          name: 'delivery',
+          leader: { name: 'delivery_lead', prompt: 'Coordinate delivery work.' },
+          teammates: [{ name: 'implementer', prompt: 'Implement the approved work.' }],
+        }],
+      },
+    })
+    const organizationPlanResult = organizationPlan.result as { content: Array<{ text: string }> }
+    const organizationPlanPayload = JSON.parse(organizationPlanResult.content[0]!.text)
+    assert.equal(organizationPlanPayload.status, 'awaiting_user_approval')
+    assert.equal(organizationPlanPayload.estimated_pool_sessions, 2)
+
+    assert.equal(organizationPlanPayload.required_user_approval, `APPROVE ORGANIZATION ${organizationPlanPayload.plan_id}`)
+    const rejectedApproval = await request('tools/call', {
+      name: 'organization_approve',
+      arguments: { plan_id: organizationPlanPayload.plan_id, user_approval: 'APPROVE ORGANIZATION some-other-plan' },
+    })
+    const rejectedApprovalResult = rejectedApproval.result as { isError?: boolean, content: Array<{ text: string }> }
+    assert.equal(rejectedApprovalResult.isError, true)
+    assert.match(rejectedApprovalResult.content[0]!.text, /user_approval must exactly match/)
   } finally {
     server.kill('SIGTERM')
     await once(server, 'exit')

@@ -8,7 +8,7 @@ This demo runs [Pool](https://github.com/poolsideai/pool) on an NVIDIA DGX Spark
 
 ## Features
 
-- **Team creation and leadership** — The current `pool` session becomes `team-lead`. Only one active team is allowed per project.
+- **Team creation and leadership** — A team always has a leader. For standalone `team_create`, pass `leader_name: "team-lead"`; the current `pool` session becomes that leader. Only one active standalone team is allowed per project.
 - **Concurrent member limits** — `team_create.max_members` limits concurrent members, including the leader. The default is four.
 - **Parallel teammate execution** — Only the leader can call `team_spawn`. Each teammate runs as an independent interactive `pool` session in the shared workspace, starting with its assigned prompt queued.
 - **Single-screen tmux view** — Every team receives a `pool-team-<team-name>` tmux session. The `team` window tiles all teammate panes together, while `team-status` displays shared state.
@@ -17,6 +17,7 @@ This demo runs [Pool](https://github.com/poolsideai/pool) on an NVIDIA DGX Spark
 - **Direct messaging** — Team members exchange progress updates, questions, and blockers by teammate name. Use `message_kind: fyi` or `ack` for non-actionable information and acknowledgements; they are recorded without interrupting recipients. A response-required lead message automatically revives an unexpectedly stopped teammate before delivery; deliberately shutdown teammates remain queued.
 - **User and leader intervention** — Attach to a teammate pane to give its Pool session more instructions or press `Esc` to interrupt its current work. The leader can use `team_interrupt` to interrupt one teammate remotely; teammates cannot interrupt one another.
 - **Automatic cleanup** — `team_delete` terminates remaining teammate panes and removes team state. When the leader Pool CLI exits, the tmux session and all teammate work stop as well. A watchdog handles unexpected leader termination.
+- **Organization coordination** — An organization contains isolated teams, each with a required team lead and its own tmux session. The organization lead first saves a team plan; Pool agents and tmux sessions start only after the user explicitly approves that plan.
 
 ## Install and build
 
@@ -54,11 +55,26 @@ tmux list-windows -t pool-team-<team-name>
 
 The `team` window displays every live teammate in a tiled pane. Select a pane to type directly into its Pool session; press `Esc` there to interrupt only its current task while leaving the session available for follow-up work. The `team-status` window displays shared state.
 
+Organization teams use one session per team:
+
+```bash
+tmux attach -t pool-org-<organization-name>-team-<team-name>
+```
+
+## Organization workflow
+
+1. Call `organization_plan` with the organization purpose and its complete team list. Every listed team must include one `leader` with a name and prompt; optional `teammates` are started with that leader.
+2. Show the returned plan ID, team list, and estimated Pool session count to the user. This operation starts no tmux session or Pool agent.
+3. Stop and ask the user for the exact `required_user_approval` statement returned by the plan. Only after a later user message contains that exact statement may the Agent call `organization_approve` with the plan ID and copied statement. Never infer, paraphrase, or create approval on the user's behalf.
+4. Each team then receives an isolated state file and tmux session. A teammate can use normal task and message tools only inside its own team. Use `organization_message_send` only from a team lead to another team lead for cross-team opinions.
+
+The organization lead can inspect the teams with `organization_status` and remove all organization resources with `organization_delete`. A team lead may manage teammates only within its own team; it cannot delete the organization.
+
 ## MCP tools
 
 | Tool | Purpose |
 | --- | --- |
-| `team_create` | Create a team and configure `max_members` |
+| `team_create` | Create a standalone team with required `leader_name: "team-lead"` and configure `max_members` |
 | `team_list`, `team_status` | Inspect members, tmux identifiers, task summary, and messages |
 | `team_adopt` | Transfer team-lead ownership to a restarted Pool CLI session |
 | `team_spawn` | Start an interactive teammate in a pane of the tmux `team` window |
@@ -68,10 +84,15 @@ The `team` window displays every live teammate in a tiled pane. Select a pane to
 | `team_interrupt` | Leader-only: interrupt a teammate's current task without closing its Pool session |
 | `team_request_shutdown` | Ask one teammate to shut down cooperatively |
 | `team_delete` | Stop all teammate panes and remove team resources |
+| `organization_plan` | Save a complete Team configuration without starting resources; every Team needs a leader |
+| `organization_approve` | Start the approved plan's Team sessions and agents |
+| `organization_status`, `organization_delete` | Inspect or remove the complete Organization |
+| `organization_message_send` | Team-lead-only cross-Team opinion sharing |
 
 ## Runtime files and safety
 
 - Team state: `.poolside/agent-team/state.json`
+- Organization state: `.poolside/agent-organization/state.json`; Team state is isolated below `.poolside/agent-organization/<organization>/teams/<team>/`
 - Teammate logs: `.poolside/agent-team/logs/`
 - tmux launch scripts: `.poolside/agent-team/run/`
 - Worker state includes the last Pool session ID, restart count, termination reason, and last error when available.

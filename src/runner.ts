@@ -15,6 +15,9 @@ export interface SpawnWorkerInput {
   tmuxSession: string
   prompt: string
   projectRoot: string
+  organizationName?: string
+  role?: TeamMember['role']
+  runtimeDirectory?: string
   agentName?: string
   model?: string
   /** Restart an existing member instead of adding a new one. */
@@ -39,6 +42,7 @@ type WorkerConfig = SpawnWorkerInput & {
   knownSessionIds: string[]
   sessionIdPath: string
   fallbackPoolArgs?: string[]
+  statePath: string
 }
 
 let workerLaunchQueue: Promise<void> = Promise.resolve()
@@ -77,11 +81,14 @@ export async function createTeamTmuxSession(input: {
   session: string
   projectRoot: string
   statePath: string
+  runtimeDirectory?: string
 }): Promise<void> {
   if (await tmuxSessionExists(input.session)) {
     throw new Error(`tmux session "${input.session}" already exists`)
   }
-  const runDirectory = join(input.projectRoot, '.poolside', 'agent-team', 'run')
+  const runDirectory = input.runtimeDirectory
+    ? join(input.runtimeDirectory, 'run')
+    : join(input.projectRoot, '.poolside', 'agent-team', 'run')
   await mkdir(runDirectory, { recursive: true })
   const dashboardPath = join(runDirectory, 'team-status.sh')
   await writeFile(
@@ -125,7 +132,7 @@ async function spawnPoolWorkerSerial(
   input: SpawnWorkerInput,
   store: TeamStore,
 ): Promise<SpawnedWorker> {
-  const teamDirectory = join(input.projectRoot, '.poolside', 'agent-team')
+  const teamDirectory = input.runtimeDirectory ?? join(input.projectRoot, '.poolside', 'agent-team')
   const runDirectory = join(teamDirectory, 'run')
   const logsDirectory = join(teamDirectory, 'logs')
   await Promise.all([mkdir(runDirectory, { recursive: true }), mkdir(logsDirectory, { recursive: true })])
@@ -156,6 +163,7 @@ async function spawnPoolWorkerSerial(
     knownSessionIds: input.resumeSessionId ? [] : await recentPoolSessionIds(input.projectRoot, poolCommand),
     sessionIdPath,
     fallbackPoolArgs: input.resumeSessionId ? basePoolArgs : undefined,
+    statePath: store.statePath,
   }
   await rm(sessionIdPath, { force: true })
   await writeFile(configPath, `${JSON.stringify(config)}\n`, { mode: 0o600 })
@@ -170,7 +178,7 @@ async function spawnPoolWorkerSerial(
     await killTmuxPaneIfPresent(existingMember.tmuxPaneId)
   }
   const hasTeammates = (await store.read())?.members.some(
-    member => member.role === 'teammate' && member.name !== input.name,
+    member => member.name !== input.name && Boolean(member.tmuxPaneId),
   ) ?? false
   const paneResult = await tmux([
     hasTeammates ? 'split-window' : 'new-window',
@@ -290,14 +298,29 @@ export function startTeamWatchdog(input: { statePath: string; session: string })
   return child.pid
 }
 
+export function startOrganizationWatchdog(input: { statePath: string }): number {
+  const watchdogEntrypoint = fileURLToPath(new URL('./organization-watchdog.js', import.meta.url))
+  const child = spawn(process.execPath, [watchdogEntrypoint, input.statePath], {
+    detached: true,
+    stdio: 'ignore',
+    env: { ...process.env, POOL_AGENT_TEAM_MEMBER: 'organization-watchdog' },
+  })
+  child.unref()
+  if (!child.pid) throw new Error('organization watchdog did not provide a process ID')
+  return child.pid
+}
+
 function buildWorkerPrompt(input: SpawnWorkerInput): string {
   return [
-    `You are teammate "${input.name}" in Pool agent team "${input.teamName}".`,
+    `You are ${input.role === 'leader' ? 'the team leader' : 'a teammate'} "${input.name}" in Pool agent team "${input.teamName}"${input.organizationName ? ` of organization "${input.organizationName}"` : ''}.`,
     'Use the agent-team MCP tools for all coordination.',
     'Start by checking task_list and message_list. Work only on tasks assigned to you or explicitly ask the lead before claiming work.',
     'A later direct coordination message from team-lead is an explicit task assignment, even when task_list has no unfinished task assigned to you. Execute it and report the result with message_send; do not dismiss it because earlier work is complete.',
     'After completing work, call task_update to mark it completed when there is a matching task, send a concise message to the requester or team-lead, then remain available for a later coordination message. Only leave the team after an explicit shutdown request.',
-    'You cannot create teammates or delete the team. Do not modify files outside the requested project.',
+    input.role === 'leader'
+      ? 'You may create and manage teammates only in your own team. Use organization_message_send only to exchange opinions with another team leader. Do not contact another team\'s teammates directly.'
+      : 'You cannot create teammates or delete the team. Do not communicate with members outside your own team.',
+    'Do not modify files outside the requested project.',
     '',
     'Assigned work:',
     input.prompt,
@@ -316,7 +339,7 @@ function buildRecoveryPrompt(message: string): string {
 function makeMember(input: SpawnWorkerInput, spawned: SpawnedWorker): TeamMember {
   return {
     name: input.name,
-    role: 'teammate',
+    role: input.role ?? 'teammate',
     agentName: input.agentName,
     model: input.model,
     prompt: input.prompt,

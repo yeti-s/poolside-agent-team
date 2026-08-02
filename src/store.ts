@@ -36,9 +36,9 @@ export class TeamStore {
   readonly statePath: string
   private readonly lockPath: string
 
-  constructor(readonly projectRoot: string) {
-    this.statePath = join(projectRoot, '.poolside', 'agent-team', 'state.json')
-    this.lockPath = join(projectRoot, '.poolside', 'agent-team', 'state.lock')
+  constructor(readonly projectRoot: string, statePath?: string) {
+    this.statePath = statePath ?? join(projectRoot, '.poolside', 'agent-team', 'state.json')
+    this.lockPath = join(dirname(this.statePath), 'state.lock')
   }
 
   async read(): Promise<TeamState | undefined> {
@@ -56,6 +56,7 @@ export class TeamStore {
     maxMembers: number
     tmuxSession: string
     leaderPid: number
+    leaderName?: string
   }): Promise<TeamState> {
     return this.mutate(async current => {
       if (current) throw new TeamError(`team "${current.team.name}" already exists`)
@@ -66,7 +67,7 @@ export class TeamStore {
           name: input.teamName,
           description: input.description,
           createdAt: now,
-          lead: 'team-lead',
+          lead: input.leaderName ?? 'team-lead',
           maxMembers: input.maxMembers,
           tmuxSession: input.tmuxSession,
           leaderPid: input.leaderPid,
@@ -76,7 +77,7 @@ export class TeamStore {
         nextMessageNumber: 1,
         members: [
           {
-            name: 'team-lead',
+            name: input.leaderName ?? 'team-lead',
             role: 'leader',
             joinedAt: now,
             status: 'idle',
@@ -245,7 +246,7 @@ export class TeamStore {
     let created!: TeamMessage
     await this.mutate(current => {
       const state = requireTeam(current)
-      if (input.from !== 'system') assertMember(state, input.from)
+      if (input.from !== 'system' && !input.from.startsWith('team:')) assertMember(state, input.from)
       if (input.to !== '*') assertMember(state, input.to)
       created = {
         id: String(state.nextMessageNumber++),
