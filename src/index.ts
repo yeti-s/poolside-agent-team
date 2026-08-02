@@ -21,6 +21,7 @@ import {
   isTmuxPaneAlive,
   killTeamTmuxSession,
   sendPromptToTmuxPane,
+  startOrganizationWatchdog,
   spawnPoolWorker,
   startTeamWatchdog,
   teamTmuxSessionName,
@@ -32,9 +33,18 @@ import {
   type MessageKind,
   type TaskStatus,
 } from './types.js'
+import { OrganizationStore, normalizePlan } from './organization.js'
 
 const projectRoot = process.env.POOL_AGENT_TEAM_PROJECT_ROOT || process.cwd()
-const store = new TeamStore(projectRoot)
+const organizationName = process.env.POOL_AGENT_ORGANIZATION
+const organizationTeamName = process.env.POOL_AGENT_TEAM_NAME
+const organizationStore = new OrganizationStore(projectRoot)
+if (organizationName && !organizationTeamName) {
+  throw new Error('organization workers require POOL_AGENT_TEAM_NAME')
+}
+const store = organizationName && organizationTeamName
+  ? organizationStore.teamStore(organizationName, organizationTeamName)
+  : new TeamStore(projectRoot)
 const server = new McpServer({ name: 'pool-agent-team', version: '0.1.0' })
 
 const nonEmpty = z.string().trim().min(1)
@@ -48,6 +58,14 @@ let cleanupInProgress = false
 
 function callerName(): string {
   return process.env.POOL_AGENT_TEAM_MEMBER || 'team-lead'
+}
+
+function isOrganizationWorker(): boolean {
+  return Boolean(organizationName && organizationTeamName)
+}
+
+function organizationTmuxSessionName(org: string, team: string): string {
+  return `pool-org-${sanitizeTeamName(org)}-team-${sanitizeTeamName(team)}`
 }
 
 function text(data: unknown) {
@@ -71,11 +89,11 @@ async function currentState() {
   return requireTeam(await store.read())
 }
 
-function buildMessagePrompt(from: string, message: string, kind: MessageKind): string {
+function buildMessagePrompt(from: string, message: string, kind: MessageKind, fromTeamLead = false): string {
   return [
     `Coordination message from ${from}:`,
     message,
-    from === 'team-lead'
+    fromTeamLead
       ? 'This is an explicit new work instruction from team-lead. Treat it as assigned work even if all existing tasks are completed or none is assigned to you. Do not merely wait or say that prior work is finished.'
       : `This ${kind} message requires a response. Check whether it affects your assigned work, then act on the relevant request.`,
     'Check task_list and message_list, perform the requested work, then send a concise completion or blocker report back to the sender with message_send.',
@@ -105,6 +123,10 @@ async function resumeMember(name: string, message?: string) {
     teamName: state.team.name,
     tmuxSession: state.team.tmuxSession,
     projectRoot,
+    organizationName,
+    runtimeDirectory: organizationName
+      ? organizationStore.teamRuntimeDirectory(organizationName, state.team.name)
+      : undefined,
     agentName: member.agentName,
     model: member.model,
     replaceExisting: true,
@@ -129,7 +151,8 @@ async function requireCaller(): Promise<string> {
 
 async function requireLead(): Promise<void> {
   const caller = await requireCaller()
-  if (caller !== 'team-lead') {
+  const state = await currentState()
+  if (state.team.lead !== caller) {
     throw new TeamError('only team-lead can perform this operation')
   }
 }
@@ -184,16 +207,230 @@ process.once('SIGHUP', () => void cleanupLeaderTeam().finally(() => process.exit
 process.stdin.once('end', () => void cleanupLeaderTeam().finally(() => process.exit(0)))
 process.once('exit', cleanStaleTeamSynchronously)
 
+const plannedMember = z.object({
+  name: nonEmpty,
+  prompt: nonEmpty,
+  agent_name: nonEmpty.optional(),
+  model: nonEmpty.optional(),
+})
+const plannedTeam = z.object({
+  name: nonEmpty,
+  description: nonEmpty.optional(),
+  leader: plannedMember.describe('Every team must define exactly one team leader.'),
+  teammates: z.array(plannedMember).optional(),
+  max_members: maxMembers.optional(),
+})
+
+server.tool(
+  'organization_plan',
+  'Save a proposed organization team list without starting tmux sessions or Pool agents. Every team requires a leader. Present the returned plan to the user and call organization_approve only after explicit user approval.',
+  {
+    organization_name: nonEmpty,
+    description: nonEmpty.optional(),
+    teams: z.array(plannedTeam).min(1),
+  },
+  async ({ organization_name, description, teams }) =>
+    execute(async () => {
+      if (isOrganizationWorker()) throw new TeamError('only organization-lead can create an organization plan')
+      const plan = await organizationStore.createPlan(normalizePlan({
+        organizationName: organization_name,
+        description,
+        teams: teams.map(team => ({
+          name: team.name,
+          description: team.description,
+          leader: {
+            name: team.leader.name,
+            prompt: team.leader.prompt,
+            agentName: team.leader.agent_name,
+            model: team.leader.model,
+          },
+          teammates: team.teammates?.map(member => ({
+            name: member.name,
+            prompt: member.prompt,
+            agentName: member.agent_name,
+            model: member.model,
+          })),
+          maxMembers: team.max_members,
+        })),
+      }))
+      return {
+        status: 'awaiting_user_approval',
+        plan_id: plan.id,
+        organization_name: plan.organizationName,
+        teams: plan.teams.map(team => ({
+          name: team.name,
+          leader: team.leader.name,
+          initial_members: 1 + team.teammates.length,
+          max_members: team.maxMembers,
+        })),
+        estimated_pool_sessions: plan.teams.reduce((total, team) => total + 1 + team.teammates.length, 0),
+      }
+    }),
+)
+
+server.tool(
+  'organization_approve',
+  'Start the exact planned organization only after the user has explicitly approved its team list. This creates tmux sessions and starts Pool agents, so approved_by_user must be true.',
+  { plan_id: nonEmpty, approved_by_user: z.literal(true) },
+  async ({ plan_id }) =>
+    execute(async () => {
+      if (isOrganizationWorker()) throw new TeamError('only organization-lead can approve an organization plan')
+      if (await organizationStore.read()) throw new TeamError('an organization already exists in this project')
+      const plan = await organizationStore.getPlan(plan_id)
+      await assertTmuxAvailable()
+      const sessions = plan.teams.map(team => ({ name: team.name, tmuxSession: organizationTmuxSessionName(plan.organizationName, team.name) }))
+      try {
+        for (const team of plan.teams) {
+          const session = sessions.find(item => item.name === team.name)!.tmuxSession
+          const teamStore = organizationStore.teamStore(plan.organizationName, team.name)
+          await teamStore.create({
+            teamName: team.name,
+            description: team.description,
+            maxMembers: team.maxMembers,
+            tmuxSession: session,
+            leaderPid: process.ppid,
+            leaderName: team.leader.name,
+          })
+          await createTeamTmuxSession({
+            session,
+            projectRoot,
+            statePath: teamStore.statePath,
+            runtimeDirectory: organizationStore.teamRuntimeDirectory(plan.organizationName, team.name),
+          })
+        }
+        const organization = await organizationStore.activate(plan, process.ppid, sessions)
+        startOrganizationWatchdog({ statePath: organizationStore.statePath })
+        for (const team of plan.teams) {
+          const session = sessions.find(item => item.name === team.name)!.tmuxSession
+          const teamStore = organizationStore.teamStore(plan.organizationName, team.name)
+          await spawnPoolWorker({
+            name: team.leader.name,
+            prompt: team.leader.prompt,
+            teamName: team.name,
+            tmuxSession: session,
+            projectRoot,
+            organizationName: plan.organizationName,
+            role: 'leader',
+            runtimeDirectory: organizationStore.teamRuntimeDirectory(plan.organizationName, team.name),
+            agentName: team.leader.agentName,
+            model: team.leader.model,
+            replaceExisting: true,
+          }, teamStore)
+          for (const teammate of team.teammates) {
+            await spawnPoolWorker({
+              name: teammate.name,
+              prompt: teammate.prompt,
+              teamName: team.name,
+              tmuxSession: session,
+              projectRoot,
+              organizationName: plan.organizationName,
+              runtimeDirectory: organizationStore.teamRuntimeDirectory(plan.organizationName, team.name),
+              agentName: teammate.agentName,
+              model: teammate.model,
+            }, teamStore)
+          }
+        }
+        return {
+          status: 'running',
+          organization: organization.organization,
+          teams: organization.teams.map(team => ({ name: team.name, lead: team.lead, tmux_session: team.tmuxSession })),
+        }
+      } catch (error) {
+        await Promise.all(sessions.map(item => killTeamTmuxSession(item.tmuxSession)))
+        await organizationStore.remove()
+        throw error
+      }
+    }),
+)
+
+server.tool(
+  'organization_status',
+  'Show the organization and its teams. Team workers can view only their own team entry.',
+  {},
+  async () => execute(async () => {
+    const state = await organizationStore.read()
+    if (!state) throw new TeamError('no organization exists in this project')
+    const teams = isOrganizationWorker()
+      ? state.teams.filter(team => team.name === organizationTeamName)
+      : state.teams
+    return { organization: state.organization, teams }
+  }),
+)
+
+server.tool(
+  'organization_message_send',
+  'Share an opinion with another team. Only a team-lead may send this message, and it is delivered only to the target team-lead.',
+  {
+    to_team: nonEmpty,
+    message: nonEmpty,
+    message_kind: messageKind.optional(),
+    requires_response: z.boolean().optional(),
+  },
+  async ({ to_team, message, message_kind, requires_response }) =>
+    execute(async () => {
+      if (!isOrganizationWorker() || !organizationName || !organizationTeamName) {
+        throw new TeamError('organization_message_send is available only to a team-lead in an organization')
+      }
+      await requireLead()
+      const organization = await organizationStore.read()
+      if (!organization) throw new TeamError('no organization exists in this project')
+      const targetName = sanitizeTeamName(to_team)
+      if (targetName === organizationTeamName) throw new TeamError('use message_send for communication within your own team')
+      const target = organization.teams.find(team => team.name === targetName)
+      if (!target) throw new TeamError(`team "${targetName}" is not part of organization "${organizationName}"`)
+      const resolvedMessageKind = message_kind ?? 'decision'
+      const responseRequired = requires_response ?? defaultRequiresResponse(resolvedMessageKind)
+      const recorded = await organizationStore.addMessage({
+        fromTeam: organizationTeamName,
+        toTeam: targetName,
+        body: message.trim(),
+        messageKind: resolvedMessageKind,
+        requiresResponse: responseRequired,
+      })
+      const targetStore = organizationStore.teamStore(organizationName, targetName)
+      const targetState = requireTeam(await targetStore.read())
+      const stored = await targetStore.addMessage({
+        from: `team:${organizationTeamName}`,
+        to: target.lead,
+        body: message,
+        messageKind: resolvedMessageKind,
+        requiresResponse: responseRequired,
+      })
+      const leader = targetState.members.find(member => member.name === target.lead)
+      if (!responseRequired || !leader?.tmuxPaneId || !(await isTmuxPaneAlive(leader.tmuxPaneId))) {
+        return { organization_message: recorded, message: stored, delivery: 'recorded_for_team_lead' }
+      }
+      await sendPromptToTmuxPane(leader.tmuxPaneId, buildMessagePrompt(`team:${organizationTeamName}`, message, resolvedMessageKind))
+      return { organization_message: recorded, message: stored, delivery: 'delivered_to_team_lead' }
+    }),
+)
+
+server.tool(
+  'organization_delete',
+  'Terminate every team tmux session and remove organization state. Only organization-lead can call this.',
+  {},
+  async () => execute(async () => {
+    if (isOrganizationWorker()) throw new TeamError('only organization-lead can delete an organization')
+    const state = await organizationStore.read()
+    if (!state) throw new TeamError('no organization exists in this project')
+    await Promise.all(state.teams.map(team => killTeamTmuxSession(team.tmuxSession)))
+    await organizationStore.remove()
+    return { deleted: true, organization_name: state.organization.name }
+  }),
+)
+
 server.tool(
   'team_create',
   'Create a shared Pool agent team and its task/message state.',
   {
     team_name: nonEmpty.describe('A unique, filesystem-safe team name.'),
     description: nonEmpty.optional(),
+    leader_name: z.literal('team-lead').describe('Required leader for a standalone team. The creating Pool session is team-lead.'),
     max_members: maxMembers.optional().describe('Maximum team size including team-lead. Defaults to 4.'),
   },
   async ({ team_name, description, max_members }) =>
     execute(async () => {
+      if (isOrganizationWorker()) throw new TeamError('create additional teams through an approved organization plan')
       if (callerName() !== 'team-lead') throw new TeamError('a teammate cannot create a team')
       const existing = await store.read()
       if (existing) {
@@ -214,6 +451,7 @@ server.tool(
         maxMembers: max_members ?? DEFAULT_MAX_MEMBERS,
         tmuxSession,
         leaderPid: process.ppid,
+        leaderName: 'team-lead',
       })
       try {
         await createTeamTmuxSession({
@@ -255,6 +493,7 @@ server.tool(
   { force: z.boolean().optional().describe('Required to take over from a still-running recorded leader.') },
   async ({ force }) =>
     execute(async () => {
+      if (isOrganizationWorker()) throw new TeamError('organization team leadership is managed by the organization')
       if (callerName() !== 'team-lead') throw new TeamError('only team-lead can adopt a team')
       const state = await currentState()
       const previousLeaderPid = state.team.leaderPid
@@ -323,6 +562,10 @@ server.tool(
         teamName: state.team.name,
         tmuxSession: state.team.tmuxSession,
         projectRoot,
+        organizationName,
+        runtimeDirectory: organizationName
+          ? organizationStore.teamRuntimeDirectory(organizationName, state.team.name)
+          : undefined,
         agentName: agent_name,
         model,
       }
@@ -430,7 +673,7 @@ server.tool(
       const deliveries = await Promise.all(recipients.map(async member => {
         const alive = member.tmuxPaneId ? await isTmuxPaneAlive(member.tmuxPaneId) : false
         if (alive && member.tmuxPaneId) {
-          await sendPromptToTmuxPane(member.tmuxPaneId, buildMessagePrompt(from, message, resolvedMessageKind))
+          await sendPromptToTmuxPane(member.tmuxPaneId, buildMessagePrompt(from, message, resolvedMessageKind, from === state.team.lead))
           await store.updateMember(member.name, current => {
             current.lastActivityAt = new Date().toISOString()
           })
@@ -439,7 +682,7 @@ server.tool(
         if (member.terminationReason === 'shutdown_requested' || member.status === 'shutdown_requested') {
           return { name: member.name, status: 'queued_shutdown_requested' as const }
         }
-        if (from !== 'team-lead') {
+        if (from !== state.team.lead) {
           return { name: member.name, status: 'queued_requires_lead_recovery' as const }
         }
         const resumed = await resumeMember(member.name, message)
@@ -457,12 +700,12 @@ server.tool(
     execute(async () => {
       await requireLead()
       const memberName = validateMemberName(name)
-      if (memberName === 'team-lead') throw new TeamError('team-lead cannot be resumed')
       const state = await currentState()
+      if (memberName === state.team.lead) throw new TeamError('team-lead cannot be resumed')
       const member = state.members.find(item => item.name === memberName)
       if (!member) throw new TeamError(`member "${memberName}" was not found`)
       if (member.tmuxPaneId && await isTmuxPaneAlive(member.tmuxPaneId)) {
-        if (message) await sendPromptToTmuxPane(member.tmuxPaneId, buildMessagePrompt('team-lead', message, 'task'))
+        if (message) await sendPromptToTmuxPane(member.tmuxPaneId, buildMessagePrompt(state.team.lead, message, 'task', true))
         return { name: memberName, resumed: false, already_running: true, message_delivered: Boolean(message) }
       }
       return { name: memberName, resumed: true, ...(await resumeMember(memberName, message)) }
@@ -485,7 +728,7 @@ server.tool(
       await requireLead()
       const state = await currentState()
       const memberName = validateMemberName(name)
-      if (memberName === 'team-lead') throw new TeamError('team-lead cannot interrupt itself')
+      if (memberName === state.team.lead) throw new TeamError('team-lead cannot interrupt itself')
       const member = state.members.find(item => item.name === memberName)
       if (!member?.tmuxPaneId) throw new TeamError(`member "${memberName}" has no running tmux pane`)
       await interruptTmuxPane(member.tmuxPaneId)
@@ -501,12 +744,13 @@ server.tool(
     execute(async () => {
       await requireLead()
       const memberName = validateMemberName(name)
-      if (memberName === 'team-lead') throw new TeamError('team-lead cannot request its own shutdown')
+      const state = await currentState()
+      if (memberName === state.team.lead) throw new TeamError('team-lead cannot request its own shutdown')
       await store.updateMember(memberName, member => {
         member.status = 'shutdown_requested'
       })
       return store.addMessage({
-        from: 'team-lead',
+        from: state.team.lead,
         to: memberName,
         kind: 'system',
         body: 'Shutdown requested: finish or safely stop your current work, update your task, and exit.',
@@ -520,6 +764,7 @@ server.tool(
   {},
   async () =>
     execute(async () => {
+      if (isOrganizationWorker()) throw new TeamError('use organization_delete to remove an organization')
       await requireLead()
       const state = await currentState()
       await killTeamTmuxSession(state.team.tmuxSession)

@@ -16,6 +16,8 @@ type WorkerConfig = {
   fallbackPoolArgs?: string[]
   agentName?: string
   model?: string
+  organizationName?: string
+  statePath: string
 }
 
 const configPath = process.argv[2]
@@ -31,6 +33,7 @@ function workerEnvironment() {
     POOL_AGENT_TEAM_MEMBER: config.name,
     POOL_AGENT_TEAM_NAME: config.teamName,
     POOL_AGENT_TEAM_PROJECT_ROOT: config.projectRoot,
+    ...(config.organizationName ? { POOL_AGENT_ORGANIZATION: config.organizationName } : {}),
     ...(config.model ? { POOL_AGENT_TEAM_MODEL: config.model } : {}),
   }
 }
@@ -51,7 +54,7 @@ async function finish(code: number | null, signal?: string, startupError?: strin
   if (finished) return
   finished = true
   try {
-    const store = new TeamStore(config.projectRoot)
+    const store = new TeamStore(config.projectRoot, config.statePath)
     await store.updateMember(config.name, member => {
       const shutdownRequested = member.status === 'shutdown_requested'
       member.status = shutdownRequested || (code === 0 && !startupError) ? 'stopped' : 'failed'
@@ -113,7 +116,7 @@ async function discoverSessionId(): Promise<void> {
         if (sessionId) {
           if (sessionDiscoveryTimer) clearInterval(sessionDiscoveryTimer)
           await writeFile(config.sessionIdPath, JSON.stringify({ sessionId, complete: true }))
-          const store = new TeamStore(config.projectRoot)
+          const store = new TeamStore(config.projectRoot, config.statePath)
           await store.updateMember(config.name, member => { member.sessionId = sessionId })
           return
         }
@@ -143,7 +146,7 @@ async function prepareFreshFallback(): Promise<void> {
   }
   config.fallbackPoolArgs = undefined
   await writeFile(config.sessionIdPath, JSON.stringify({ complete: false }))
-  const store = new TeamStore(config.projectRoot)
+  const store = new TeamStore(config.projectRoot, config.statePath)
   await store.updateMember(config.name, member => { member.sessionId = undefined })
   void discoverSessionId()
 }
