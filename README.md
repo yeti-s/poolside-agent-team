@@ -65,7 +65,7 @@ tmux attach -t pool-org-<organization-name>-team-<team-name>
 
 1. Call `organization_plan` with the organization purpose and its complete team list. Every listed team must include one `leader` with a name and prompt; optional `teammates` are started with that leader.
 2. Show the returned plan ID, team list, and estimated Pool session count to the user. This operation starts no tmux session or Pool agent.
-3. Only after the user explicitly approves the list, call `organization_approve` with that exact `plan_id` and `approved_by_user: true`.
+3. Call `organization_approve` with that exact `plan_id`. Pool displays an interactive confirmation form; it starts only when the user selects approval in that form. An Agent cannot approve by passing a tool argument.
 4. Each team then receives an isolated state file and tmux session. A teammate can use normal task and message tools only inside its own team. Use `organization_message_send` only from a team lead to another team lead for cross-team opinions.
 
 The organization lead can inspect the teams with `organization_status` and remove all organization resources with `organization_delete`. A team lead may manage teammates only within its own team; it cannot delete the organization.

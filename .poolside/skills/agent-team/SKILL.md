@@ -21,8 +21,10 @@ agents for every planned team.
 2. Present the returned `plan_id`, team names, team leads, and estimated Pool
    session count to the user. Do not call `organization_approve` until the user
    explicitly approves this exact list.
-3. After approval, call `organization_approve` with the plan ID and
-   `approved_by_user: true`. This starts one tmux session per team.
+3. Call `organization_approve` with the plan ID only after presenting the
+   plan. Pool displays an interactive confirmation form; wait for the user's
+   response. Do not claim or assume approval on the user's behalf. This starts
+   one tmux session per team only when the user accepts the form.
 4. A teammate may use tasks and `message_send` only within its own team. Never
    attempt to name, inspect, or contact a member in another team.
 5. A team lead may use `organization_message_send` only to share an opinion

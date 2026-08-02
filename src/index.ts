@@ -68,6 +68,33 @@ function organizationTmuxSessionName(org: string, team: string): string {
   return `pool-org-${sanitizeTeamName(org)}-team-${sanitizeTeamName(team)}`
 }
 
+async function requestOrganizationApproval(plan: Awaited<ReturnType<typeof organizationStore.getPlan>>): Promise<void> {
+  let result: { action: 'accept' | 'decline' | 'cancel', content?: Record<string, unknown> }
+  try {
+    result = await server.server.elicitInput({
+      mode: 'form',
+      message: `Start organization "${plan.organizationName}" with ${plan.teams.length} team(s) and ${plan.teams.reduce((total, team) => total + 1 + team.teammates.length, 0)} Pool agent session(s)?`,
+      requestedSchema: {
+        type: 'object',
+        properties: {
+          approve: {
+            type: 'boolean',
+            title: 'Start this organization',
+            description: 'Creates one tmux session per team and starts the planned Pool agents.',
+            default: false,
+          },
+        },
+        required: ['approve'],
+      },
+    })
+  } catch {
+    throw new TeamError('organization approval requires an interactive user confirmation, but this Pool client does not support it')
+  }
+  if (result.action !== 'accept' || result.content?.approve !== true) {
+    throw new TeamError('organization start was not approved by the user')
+  }
+}
+
 function text(data: unknown) {
   return { content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }] }
 }
@@ -270,13 +297,14 @@ server.tool(
 
 server.tool(
   'organization_approve',
-  'Start the exact planned organization only after the user has explicitly approved its team list. This creates tmux sessions and starts Pool agents, so approved_by_user must be true.',
-  { plan_id: nonEmpty, approved_by_user: z.literal(true) },
+  'Request an interactive user confirmation, then start the exact planned organization only when the user approves. This creates tmux sessions and starts Pool agents.',
+  { plan_id: nonEmpty },
   async ({ plan_id }) =>
     execute(async () => {
       if (isOrganizationWorker()) throw new TeamError('only organization-lead can approve an organization plan')
       if (await organizationStore.read()) throw new TeamError('an organization already exists in this project')
       const plan = await organizationStore.getPlan(plan_id)
+      await requestOrganizationApproval(plan)
       await assertTmuxAvailable()
       const sessions = plan.teams.map(team => ({ name: team.name, tmuxSession: organizationTmuxSessionName(plan.organizationName, team.name) }))
       try {
