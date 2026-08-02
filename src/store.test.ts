@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import { TeamError, TeamStore, sanitizeTeamName, validateMemberName } from './store.js'
+import { defaultRequiresResponse } from './types.js'
 
 async function createTeam(store: TeamStore, overrides: Partial<{
   teamName: string
@@ -100,6 +101,29 @@ test('delivers and marks messages addressed to a teammate', async () => {
     assert.equal((await store.messagesFor('tester', true)).length, 2)
     const status = await store.status('tester', () => false)
     assert.equal(status.pendingMessages, 0)
+  })
+})
+
+test('records acknowledgement messages without requiring a response', async () => {
+  await withStore(async store => {
+    await createTeam(store)
+    await store.addMember({
+      name: 'tester',
+      role: 'teammate',
+      joinedAt: new Date().toISOString(),
+      status: 'idle',
+    })
+    const message = await store.addMessage({
+      from: 'team-lead',
+      to: 'tester',
+      body: 'Thanks for the review.',
+      messageKind: 'ack',
+      requiresResponse: defaultRequiresResponse('ack'),
+    })
+    assert.equal(message.messageKind, 'ack')
+    assert.equal(message.requiresResponse, false)
+    assert.equal(defaultRequiresResponse('fyi'), false)
+    assert.equal(defaultRequiresResponse('task'), true)
   })
 })
 

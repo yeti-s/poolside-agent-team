@@ -1,6 +1,8 @@
 export const TASK_STATUSES = ['pending', 'in_progress', 'completed'] as const
+export const MESSAGE_KINDS = ['task', 'handoff', 'decision', 'fyi', 'ack'] as const
 
 export type TaskStatus = (typeof TASK_STATUSES)[number]
+export type MessageKind = (typeof MESSAGE_KINDS)[number]
 export type MemberStatus =
   | 'running'
   | 'idle'
@@ -50,6 +52,15 @@ export interface TeamMessage {
   createdAt: string
   readAt?: string
   kind: 'message' | 'system'
+  /** Semantic purpose of a user-sent message. System messages omit this. */
+  messageKind?: MessageKind
+  /** Whether the recipient should be prompted to take action and report back. */
+  requiresResponse?: boolean
+}
+
+/** FYI and acknowledgement messages are recorded without interrupting a teammate. */
+export function defaultRequiresResponse(messageKind: MessageKind): boolean {
+  return messageKind !== 'fyi' && messageKind !== 'ack'
 }
 
 export interface TeamState {

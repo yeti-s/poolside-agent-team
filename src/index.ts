@@ -25,7 +25,13 @@ import {
   startTeamWatchdog,
   teamTmuxSessionName,
 } from './runner.js'
-import { TASK_STATUSES, type TaskStatus } from './types.js'
+import {
+  MESSAGE_KINDS,
+  TASK_STATUSES,
+  defaultRequiresResponse,
+  type MessageKind,
+  type TaskStatus,
+} from './types.js'
 
 const projectRoot = process.env.POOL_AGENT_TEAM_PROJECT_ROOT || process.cwd()
 const store = new TeamStore(projectRoot)
@@ -33,6 +39,7 @@ const server = new McpServer({ name: 'pool-agent-team', version: '0.1.0' })
 
 const nonEmpty = z.string().trim().min(1)
 const taskStatus = z.enum(TASK_STATUSES)
+const messageKind = z.enum(MESSAGE_KINDS)
 const maxMembers = z.number().int().min(1).max(64)
 const recoveryMessage = z.string().trim().min(1).max(20_000)
 let heartbeatTimer: NodeJS.Timeout | undefined
@@ -64,13 +71,13 @@ async function currentState() {
   return requireTeam(await store.read())
 }
 
-function buildMessagePrompt(from: string, message: string): string {
+function buildMessagePrompt(from: string, message: string, kind: MessageKind): string {
   return [
     `Coordination message from ${from}:`,
     message,
     from === 'team-lead'
       ? 'This is an explicit new work instruction from team-lead. Treat it as assigned work even if all existing tasks are completed or none is assigned to you. Do not merely wait or say that prior work is finished.'
-      : 'Check whether this coordination message affects your assigned work, then act on the relevant request.',
+      : `This ${kind} message requires a response. Check whether it affects your assigned work, then act on the relevant request.`,
     'Check task_list and message_list, perform the requested work, then send a concise completion or blocker report back to the sender with message_send.',
   ].join('\n')
 }
@@ -387,21 +394,43 @@ server.tool(
 
 server.tool(
   'message_send',
-  'Send a text message to a teammate by name, or use * for all teammates. A message from team-lead is an explicit work instruction even if the recipient previously completed its tasks. Live teammates receive an interactive follow-up prompt. Recoverable stopped or failed teammates are automatically resumed before delivery; a shutdown-requested teammate is only queued.',
-  { to: nonEmpty, message: nonEmpty },
-  async ({ to, message }) =>
+  'Send a message to a teammate by name, or use * for all teammates. Choose message_kind: task, handoff, and decision messages prompt a response by default; fyi and ack messages are recorded for message_list without interrupting or restarting recipients. requires_response overrides that default. A task message from team-lead is an explicit work instruction even if the recipient previously completed its tasks.',
+  {
+    to: nonEmpty,
+    message: nonEmpty,
+    message_kind: messageKind.optional().describe('task, handoff, decision, fyi, or ack. Defaults to task.'),
+    requires_response: z.boolean().optional().describe('Whether to prompt the recipient for action and a report. Defaults to false for fyi/ack and true otherwise.'),
+  },
+  async ({ to, message, message_kind, requires_response }) =>
     execute(async () => {
       const from = await requireCaller()
       const state = await currentState()
       if (to !== '*') assertMember(state, to)
-      const stored = await store.addMessage({ from, to, body: message })
+      const resolvedMessageKind = message_kind ?? 'task'
+      const responseRequired = requires_response ?? defaultRequiresResponse(resolvedMessageKind)
+      const stored = await store.addMessage({
+        from,
+        to,
+        body: message,
+        messageKind: resolvedMessageKind,
+        requiresResponse: responseRequired,
+      })
       const recipients = state.members.filter(member =>
         member.role === 'teammate' && (to === '*' || member.name === to),
       )
+      if (!responseRequired) {
+        return {
+          message: stored,
+          deliveries: recipients.map(member => ({
+            name: member.name,
+            status: 'recorded_no_prompt' as const,
+          })),
+        }
+      }
       const deliveries = await Promise.all(recipients.map(async member => {
         const alive = member.tmuxPaneId ? await isTmuxPaneAlive(member.tmuxPaneId) : false
         if (alive && member.tmuxPaneId) {
-          await sendPromptToTmuxPane(member.tmuxPaneId, buildMessagePrompt(from, message))
+          await sendPromptToTmuxPane(member.tmuxPaneId, buildMessagePrompt(from, message, resolvedMessageKind))
           await store.updateMember(member.name, current => {
             current.lastActivityAt = new Date().toISOString()
           })
@@ -433,7 +462,7 @@ server.tool(
       const member = state.members.find(item => item.name === memberName)
       if (!member) throw new TeamError(`member "${memberName}" was not found`)
       if (member.tmuxPaneId && await isTmuxPaneAlive(member.tmuxPaneId)) {
-        if (message) await sendPromptToTmuxPane(member.tmuxPaneId, buildMessagePrompt('team-lead', message))
+        if (message) await sendPromptToTmuxPane(member.tmuxPaneId, buildMessagePrompt('team-lead', message, 'task'))
         return { name: memberName, resumed: false, already_running: true, message_delivered: Boolean(message) }
       }
       return { name: memberName, resumed: true, ...(await resumeMember(memberName, message)) }

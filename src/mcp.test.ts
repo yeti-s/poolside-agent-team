@@ -67,6 +67,10 @@ test('serves agent-team tools through the MCP stdio protocol', async () => {
     assert.ok(names.includes('team_adopt'))
     assert.ok(names.includes('team_resume'))
     assert.ok(names.includes('team_interrupt'))
+    const messageSend = (tools.result as { tools: Array<{ name: string, inputSchema: { properties?: Record<string, unknown> } }> }).tools
+      .find(tool => tool.name === 'message_send')
+    assert.ok(messageSend?.inputSchema.properties?.message_kind)
+    assert.ok(messageSend?.inputSchema.properties?.requires_response)
 
     const create = await request('tools/call', {
       name: 'team_create',
@@ -85,6 +89,15 @@ test('serves agent-team tools through the MCP stdio protocol', async () => {
     })
     const taskResult = task.result as { content: Array<{ text: string }> }
     assert.equal(JSON.parse(taskResult.content[0]!.text).id, '1')
+
+    const acknowledgement = await request('tools/call', {
+      name: 'message_send',
+      arguments: { to: 'team-lead', message: 'Thanks.', message_kind: 'ack' },
+    })
+    const acknowledgementResult = acknowledgement.result as { content: Array<{ text: string }> }
+    const acknowledgementPayload = JSON.parse(acknowledgementResult.content[0]!.text)
+    assert.equal(acknowledgementPayload.message.messageKind, 'ack')
+    assert.equal(acknowledgementPayload.message.requiresResponse, false)
   } finally {
     server.kill('SIGTERM')
     await once(server, 'exit')
