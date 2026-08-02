@@ -71,6 +71,22 @@ test('maintains task dependencies and refuses blocked work', async () => {
   })
 })
 
+test('uses dependsOn for normal prerequisite ordering without reversing the relationship', async () => {
+  await withStore(async store => {
+    await createTeam(store)
+    const foundation = await store.addTask({ subject: 'Create API', description: 'Implement API foundation' })
+    const client = await store.addTask({
+      subject: 'Create client',
+      description: 'Implement the client after the API',
+      dependsOn: [foundation.id],
+    })
+    assert.deepEqual(client.blockedBy, [foundation.id])
+    await assert.rejects(() => store.updateTask(client.id, { status: 'in_progress' }), /blocked by: 1/)
+    await store.updateTask(foundation.id, { status: 'completed' })
+    assert.equal((await store.updateTask(client.id, { status: 'in_progress' })).status, 'in_progress')
+  })
+})
+
 test('assigns tasks only to registered members and clears an owner', async () => {
   await withStore(async store => {
     await createTeam(store)

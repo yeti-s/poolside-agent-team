@@ -170,13 +170,16 @@ export class TeamStore {
     description: string
     owner?: string
     blocks?: string[]
+    dependsOn?: string[]
   }): Promise<TeamTask> {
     let created!: TeamTask
     await this.mutate(current => {
       const state = requireTeam(current)
       if (input.owner) assertMember(state, input.owner)
       const blocks = input.blocks ?? []
+      const dependsOn = input.dependsOn ?? []
       assertTaskIds(state, blocks)
+      assertTaskIds(state, dependsOn)
       const now = new Date().toISOString()
       created = {
         id: String(state.nextTaskNumber++),
@@ -185,7 +188,7 @@ export class TeamStore {
         status: 'pending',
         owner: input.owner,
         blocks,
-        blockedBy: [],
+        blockedBy: [...new Set(dependsOn)],
         createdAt: now,
         updatedAt: now,
         lastProgressAt: now,
@@ -209,6 +212,7 @@ export class TeamStore {
       status?: TaskStatus
       owner?: string | null
       blocks?: string[]
+      dependsOn?: string[]
       progressNote?: string
     },
   ): Promise<TeamTask> {
@@ -231,6 +235,11 @@ export class TeamStore {
           if (!newBlocked.blockedBy.includes(id)) newBlocked.blockedBy.push(id)
         }
       }
+      if (input.dependsOn) {
+        if (input.dependsOn.includes(id)) throw new TeamError('a task cannot depend on itself')
+        assertTaskIds(state, input.dependsOn)
+        task.blockedBy = [...new Set(input.dependsOn)]
+      }
       if (input.subject !== undefined) task.subject = input.subject.trim()
       if (input.description !== undefined) task.description = input.description.trim()
       if (input.status !== undefined) task.status = input.status
@@ -252,6 +261,7 @@ export class TeamStore {
         || task.status !== previous.status
         || task.owner !== previous.owner
         || JSON.stringify(task.blocks) !== JSON.stringify(previous.blocks)
+        || JSON.stringify(task.blockedBy) !== JSON.stringify(previous.blockedBy)
       if (madeProgress) {
         task.lastProgressAt = now
         task.lastProgressNote = progressNote ?? task.lastProgressNote

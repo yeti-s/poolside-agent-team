@@ -80,7 +80,7 @@ The organization lead can inspect the teams with `organization_status` and remov
 | `team_adopt` | Transfer team-lead ownership to a restarted Pool CLI session |
 | `team_spawn` | Start an interactive teammate in a pane of the tmux `team` window |
 | `team_resume` | Explicitly restart a stopped or failed teammate, preferring its saved Pool session |
-| `task_create`, `task_list`, `task_update` | Create, view, assign, and complete shared tasks; use `task_update.progress_note` for concrete progress or blockers |
+| `task_create`, `task_list`, `task_update` | Create, view, assign, and complete shared tasks; use `depends_on` for prerequisites and `task_update.progress_note` for concrete progress or blockers |
 | `message_send`, `message_list` | Send and read teammate messages (`task`/`handoff`/`decision` prompt a response; `fyi`/`ack` do not) |
 | `team_interrupt` | Leader-only: interrupt a teammate's current task without closing its Pool session |
 | `team_request_shutdown` | Ask one teammate to shut down cooperatively |
@@ -127,3 +127,8 @@ sends `Esc` to stop the current thinking turn, then directs the teammate to
 create or update 2–4 smaller tasks with acceptance criteria and work only on
 the smallest next step. An escalation is sent once per unchanged stretch;
 recording real progress resets the counter.
+
+Use `depends_on` when one task must finish before another can start. The older
+`blocks` field is intentionally retained for compatibility, but has the inverse
+meaning: it lists tasks that the current task prevents from starting. Using
+`blocks` as a normal dependency can deadlock a team.

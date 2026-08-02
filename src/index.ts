@@ -116,6 +116,80 @@ function buildMessagePrompt(from: string, message: string, kind: MessageKind, fr
   ].join('\n')
 }
 
+function buildTaskAssignmentMessage(task: { id: string, subject: string, description: string }): string {
+  return [
+    `You have been assigned task #${task.id}: ${task.subject}`,
+    task.description,
+    'Start with the smallest concrete step. Call task_update to mark the task in_progress and include a progress_note for each material result or blocker.',
+  ].join('\n\n')
+}
+
+async function deliverTaskAssignment(task: {
+  id: string
+  subject: string
+  description: string
+  owner?: string
+  blockedBy: string[]
+}, from: string) {
+  if (!task.owner || task.owner === from) return { status: 'not_required' as const }
+  const state = await currentState()
+  const member = state.members.find(item => item.name === task.owner)
+  if (!member) return { status: 'owner_not_found' as const }
+  if (member.role !== 'teammate') return { status: 'recorded_for_team_lead' as const }
+  const hasIncompleteDependency = task.blockedBy.some(id =>
+    state.tasks.find(candidate => candidate.id === id)?.status !== 'completed',
+  )
+  if (hasIncompleteDependency) return { status: 'queued_until_dependencies_complete' as const }
+  const message = buildTaskAssignmentMessage(task)
+  const stored = await store.addMessage({
+    from,
+    to: member.name,
+    body: message,
+    messageKind: 'task',
+    requiresResponse: true,
+  })
+  const alive = member.tmuxPaneId ? await isTmuxPaneAlive(member.tmuxPaneId) : false
+  if (alive && member.tmuxPaneId) {
+    await sendPromptToTmuxPane(
+      member.tmuxPaneId,
+      buildMessagePrompt(from, message, 'task', from === state.team.lead),
+    )
+    return { status: 'delivered' as const, message: stored }
+  }
+  if (member.terminationReason === 'shutdown_requested' || member.status === 'shutdown_requested') {
+    return { status: 'queued_shutdown_requested' as const, message: stored }
+  }
+  if (from !== state.team.lead) return { status: 'queued_requires_lead_recovery' as const, message: stored }
+  const resumed = await resumeMember(member.name, message)
+  return { status: 'resumed_and_delivered' as const, message: stored, ...resumed }
+}
+
+async function deliverNewlyUnblockedTasks(completedTaskId: string, from: string) {
+  const state = await currentState()
+  const candidates = state.tasks.filter(task =>
+    task.status === 'pending'
+    && Boolean(task.owner)
+    && task.blockedBy.includes(completedTaskId)
+    && task.blockedBy.every(id => state.tasks.find(candidate => candidate.id === id)?.status === 'completed'),
+  )
+  return Promise.all(candidates.map(task => deliverTaskAssignment(task, from)))
+}
+
+function memberWorkStatus(memberName: string, state: Awaited<ReturnType<typeof currentState>>) {
+  const owned = state.tasks.filter(task => task.owner === memberName && task.status !== 'completed')
+  const active = owned.filter(task => task.status === 'in_progress')
+  if (active.length > 0) return { status: 'working' as const, taskIds: active.map(task => task.id) }
+  const pending = owned.filter(task => task.status === 'pending')
+  if (pending.length === 0) return { status: 'waiting_for_assignment' as const, taskIds: [] }
+  const blocked = pending.every(task => task.blockedBy.some(id =>
+    state.tasks.find(candidate => candidate.id === id)?.status !== 'completed',
+  ))
+  return {
+    status: blocked ? 'blocked' as const : 'assigned_pending' as const,
+    taskIds: pending.map(task => task.id),
+  }
+}
+
 function progressReminderPrompt(task: { id: string, subject: string }, intervalMinutes: number): string {
   return [
     `Automated team-lead progress review: task #${task.id} "${task.subject}" has no recorded material progress for ${intervalMinutes} minutes.`,
@@ -635,10 +709,11 @@ server.tool(
     }),
 )
 
-server.tool('team_status', 'Show team member liveness, task counts, and unread messages.', {}, async () =>
+server.tool('team_status', 'Show worker-process liveness separately from each teammate’s assigned-work status, task counts, unread messages, and unassigned tasks.', {}, async () =>
   execute(async () => {
     const caller = await requireCaller()
     const status = await store.status(caller, isProcessAlive)
+    const state = await currentState()
     const members = await Promise.all(status.members.map(async member => ({
       ...member,
       alive: member.tmuxPaneId
@@ -649,12 +724,16 @@ server.tool('team_status', 'Show team member liveness, task counts, and unread m
       ...status,
       members: members.map(member => ({
         ...member,
+        work_status: member.role === 'teammate' ? memberWorkStatus(member.name, state) : undefined,
         runtime_status: member.role === 'teammate' && !member.alive
           ? member.terminationReason === 'shutdown_requested'
             ? 'shutdown_requested'
             : 'recoverable'
           : 'live',
       })),
+      unassigned_tasks: state.tasks
+        .filter(task => task.status !== 'completed' && !task.owner)
+        .map(task => ({ id: task.id, subject: task.subject, status: task.status })),
     }
   }),
 )
@@ -704,17 +783,20 @@ server.tool(
 
 server.tool(
   'task_create',
-  'Create a task in the shared team task list.',
+  'Create a task in the shared team task list. Use depends_on for prerequisite task IDs; blocks is the legacy inverse relation for task IDs that this task prevents from starting. Supplying a teammate owner immediately delivers an actionable assignment prompt to that teammate; an unowned task is only recorded and will appear as unassigned in team_status.',
   {
     subject: nonEmpty,
     description: nonEmpty,
     owner: nonEmpty.optional().describe('Optional teammate name.'),
-    blocks: z.array(nonEmpty).optional().describe('IDs of tasks blocked by this task.'),
+    depends_on: z.array(nonEmpty).optional().describe('IDs of prerequisite tasks that must be completed before this task can start.'),
+    blocks: z.array(nonEmpty).optional().describe('Legacy inverse relation: IDs of tasks this task prevents from starting. Prefer depends_on for normal task ordering.'),
   },
-  async ({ subject, description, owner, blocks }) =>
+  async ({ subject, description, owner, blocks, depends_on }) =>
     execute(async () => {
-      await requireCaller()
-      return store.addTask({ subject, description, owner, blocks })
+      const from = await requireCaller()
+      const task = await store.addTask({ subject, description, owner, blocks, dependsOn: depends_on })
+      const assignment_delivery = await deliverTaskAssignment(task, from)
+      return { ...task, assignment_delivery }
     }),
 )
 
@@ -728,32 +810,42 @@ server.tool('task_list', 'List all shared tasks in ID order.', {}, async () =>
 
 server.tool(
   'task_update',
-  'Update a task status, owner, content, or dependency list.',
+  'Update a task status, owner, content, or dependency list. Use depends_on for prerequisite task IDs; blocks is the legacy inverse relation. Assigning a teammate immediately delivers an actionable assignment prompt to that teammate.',
   {
     task_id: nonEmpty,
     subject: nonEmpty.optional(),
     description: nonEmpty.optional(),
     status: taskStatus.optional(),
     owner: nonEmpty.nullable().optional().describe('Teammate name; pass null to clear.'),
-    blocks: z.array(nonEmpty).optional(),
+    depends_on: z.array(nonEmpty).optional().describe('Prerequisite task IDs that must complete before this task can start.'),
+    blocks: z.array(nonEmpty).optional().describe('Legacy inverse relation. Prefer depends_on.'),
     progress_note: nonEmpty.optional().describe('Concrete result, evidence, or blocker. Resets the leader progress-watchdog timer.'),
   },
-  async ({ task_id, subject, description, status, owner, blocks, progress_note }) =>
+  async ({ task_id, subject, description, status, owner, blocks, depends_on, progress_note }) =>
     execute(async () => {
-      await requireCaller()
+      const from = await requireCaller()
+      const before = (await currentState()).tasks.find(item => item.id === task_id)
       if (status === 'in_progress' && owner === undefined) {
         const state = await currentState()
         const task = state.tasks.find(item => item.id === task_id)
         if (task && !task.owner) owner = callerName()
       }
-      return store.updateTask(task_id, {
+      const task = await store.updateTask(task_id, {
         subject,
         description,
         status: status as TaskStatus | undefined,
         owner,
         blocks,
+        dependsOn: depends_on,
         progressNote: progress_note,
       })
+      const assignment_delivery = owner !== undefined && task.owner !== before?.owner
+        ? await deliverTaskAssignment(task, from)
+        : { status: 'not_required' as const }
+      const unblocked_deliveries = task.status === 'completed' && before?.status !== 'completed'
+        ? await deliverNewlyUnblockedTasks(task.id, from)
+        : []
+      return { ...task, assignment_delivery, unblocked_deliveries }
     }),
 )
 
