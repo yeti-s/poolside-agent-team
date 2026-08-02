@@ -13,6 +13,7 @@ This demo runs [Pool](https://github.com/poolsideai/pool) on an NVIDIA DGX Spark
 - **Parallel teammate execution** — Only the leader can call `team_spawn`. Each teammate runs as an independent interactive `pool` session in the shared workspace, starting with its assigned prompt queued.
 - **Single-screen tmux view** — Every team receives a `pool-team-<team-name>` tmux session. The `team` window tiles all teammate panes together, while `team-status` displays shared state.
 - **Shared task coordination** — Teammates share tasks, ownership, dependencies, and completion state. Finished or failed teammates free a slot for a replacement.
+- **Progress watchdog** — The leader sidecar checks each live teammate's in-progress task every five minutes by default. After two unchanged checks, it interrupts the open-ended turn and requires the teammate to split the work into small, independently verifiable steps before continuing.
 - **Recoverable teammates** — Each worker records its Pool session ID when available. A stopped worker can resume that session; if it cannot, the team starts a fresh recovery session with its role, outstanding tasks, and unread messages.
 - **Direct messaging** — Team members exchange progress updates, questions, and blockers by teammate name. Use `message_kind: fyi` or `ack` for non-actionable information and acknowledgements; they are recorded without interrupting recipients. A response-required lead message automatically revives an unexpectedly stopped teammate before delivery; deliberately shutdown teammates remain queued.
 - **User and leader intervention** — Attach to a teammate pane to give its Pool session more instructions or press `Esc` to interrupt its current work. The leader can use `team_interrupt` to interrupt one teammate remotely; teammates cannot interrupt one another.
@@ -74,12 +75,12 @@ The organization lead can inspect the teams with `organization_status` and remov
 
 | Tool | Purpose |
 | --- | --- |
-| `team_create` | Create a standalone team with required `leader_name: "team-lead"` and configure `max_members` |
+| `team_create` | Create a standalone team with required `leader_name: "team-lead"`; configure `max_members`, `progress_check_interval_minutes` (default 5), and `stalled_check_limit` (default 2) |
 | `team_list`, `team_status` | Inspect members, tmux identifiers, task summary, and messages |
 | `team_adopt` | Transfer team-lead ownership to a restarted Pool CLI session |
 | `team_spawn` | Start an interactive teammate in a pane of the tmux `team` window |
 | `team_resume` | Explicitly restart a stopped or failed teammate, preferring its saved Pool session |
-| `task_create`, `task_list`, `task_update` | Create, view, assign, and complete shared tasks |
+| `task_create`, `task_list`, `task_update` | Create, view, assign, and complete shared tasks; use `task_update.progress_note` for concrete progress or blockers |
 | `message_send`, `message_list` | Send and read teammate messages (`task`/`handoff`/`decision` prompt a response; `fyi`/`ack` do not) |
 | `team_interrupt` | Leader-only: interrupt a teammate's current task without closing its Pool session |
 | `team_request_shutdown` | Ask one teammate to shut down cooperatively |
@@ -114,3 +115,15 @@ the original leader is still alive). The old lead then no longer owns cleanup
 of the tmux session, so it can exit safely.
 
 Teammates run as `pool --mode always-allow` interactive sessions. They can edit files and execute commands without per-action approval, so use this only in trusted projects. All teammates share one workspace; split work to avoid editing the same files concurrently.
+
+## Long-running task handling
+
+For every in-progress task with a live teammate owner, the leader sidecar checks
+`lastProgressAt` on the configured cadence. A material `task_update` (status,
+owner, task content, dependencies, or a non-empty `progress_note`) resets this
+timer. The first unchanged review asks for a concrete progress/blocker report.
+At the configured `stalled_check_limit` (two checks by default), the sidecar
+sends `Esc` to stop the current thinking turn, then directs the teammate to
+create or update 2–4 smaller tasks with acceptance criteria and work only on
+the smallest next step. An escalation is sent once per unchanged stretch;
+recording real progress resets the counter.

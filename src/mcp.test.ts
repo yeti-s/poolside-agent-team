@@ -74,13 +74,24 @@ test('serves agent-team tools through the MCP stdio protocol', async () => {
       .find(tool => tool.name === 'message_send')
     assert.ok(messageSend?.inputSchema.properties?.message_kind)
     assert.ok(messageSend?.inputSchema.properties?.requires_response)
+    const teamCreate = (tools.result as { tools: Array<{ name: string, inputSchema: { properties?: Record<string, unknown> } }> }).tools
+      .find(tool => tool.name === 'team_create')
+    assert.ok(teamCreate?.inputSchema.properties?.progress_check_interval_minutes)
+    assert.ok(teamCreate?.inputSchema.properties?.stalled_check_limit)
 
     const create = await request('tools/call', {
       name: 'team_create',
-      arguments: { team_name: 'MCP Feature', description: 'MCP test team', leader_name: 'team-lead' },
+      arguments: {
+        team_name: 'MCP Feature',
+        description: 'MCP test team',
+        leader_name: 'team-lead',
+        progress_check_interval_minutes: 5,
+        stalled_check_limit: 2,
+      },
     })
     const result = create.result as { content: Array<{ text: string }> }
     assert.equal(JSON.parse(result.content[0]!.text).team_name, 'mcp-feature')
+    assert.equal(JSON.parse(result.content[0]!.text).progress_check_interval_minutes, 5)
 
     const adopt = await request('tools/call', { name: 'team_adopt', arguments: {} })
     const adoptResult = adopt.result as { content: Array<{ text: string }> }

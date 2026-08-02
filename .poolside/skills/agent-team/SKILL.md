@@ -38,7 +38,10 @@ agents for every planned team.
 
 1. Call `team_create` once with a concise name, purpose, required
    `leader_name: "team-lead"`, and optional `max_members`. The default is 4
-   concurrent members and the limit includes `team-lead`.
+   concurrent members and the limit includes `team-lead`. The leader progress
+   watchdog checks live in-progress teammate tasks every 5 minutes by default;
+   configure `progress_check_interval_minutes` and `stalled_check_limit` only
+   when the work needs a different cadence.
 2. Break the work into small shared tasks with `task_create`; add blocking
    task IDs when order matters.
    If the leader Pool CLI was restarted while preserving an existing team, call
@@ -48,10 +51,18 @@ agents for every planned team.
    teammate a precise outcome and name it by role, such as `researcher` or
    `tester`.
 4. Assign each task with `task_update`. Use teammate names, never internal IDs.
-5. After a task, update its status and check `task_list` plus `message_list`
-   before claiming more work. An idle teammate can receive a new task and is
-   not necessarily finished.
-6. Use `message_send` with `message_kind: task`, `handoff`, or `decision` for
+5. While a task is in progress, record each material result, evidence, or
+   blocker through `task_update.progress_note`; a repeated unchanged status is
+   not progress. After a task, update its status and check `task_list` plus
+   `message_list` before claiming more work. An idle teammate can receive a
+   new task and is not necessarily finished.
+6. On the first unchanged watchdog review, report concrete progress or the
+   exact blocker. At the stalled-check limit (2 reviews by default), the
+   watchdog interrupts the teammate's current thinking turn and directs it to
+   split the task into 2–4 small, independently verifiable tasks before it
+   continues. The lead should review that decomposition and reassign work as
+   needed instead of allowing open-ended analysis to resume.
+7. Use `message_send` with `message_kind: task`, `handoff`, or `decision` for
    decisions, blockers, and handoffs; these deliver a follow-up prompt to a
    live teammate. Use `message_kind: fyi` for information and `ack` for a
    short acknowledgement: they are recorded for `message_list` but do not
@@ -60,14 +71,14 @@ agents for every planned team.
    to a worker whose pane stopped unexpectedly, agent-team restores that worker
    first and then delivers the message. A deliberately shutdown worker stays
    queued.
-7. Call `team_status` before a critical handoff. Use `team_resume` when you
+8. Call `team_status` before a critical handoff. Use `team_resume` when you
    need to explicitly revive a stopped worker; it resumes the worker's saved
    Pool session when available and otherwise starts a fresh recovery session.
-8. Use `tmux attach -t pool-team-<team-name>` to inspect live teammates. The
+9. Use `tmux attach -t pool-team-<team-name>` to inspect live teammates. The
    `team` window shows all teammate panes together; `team-status` shows shared
    state. You can select a pane to give its Pool session an additional prompt,
    or press `Esc` there to interrupt its current work.
-9. Only the lead can interrupt another teammate through `team_interrupt`; a
+10. Only the lead can interrupt another teammate through `team_interrupt`; a
    teammate must never attempt to interrupt another teammate. Ask finished
    teammates to stop with `team_request_shutdown`. `team_delete` terminates
    remaining teammate panes and removes team state.

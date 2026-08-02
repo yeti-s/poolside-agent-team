@@ -147,6 +147,58 @@ test('preserves worker recovery metadata through state reads', async () => {
   })
 })
 
+test('tracks unchanged work and requests decomposition after repeated leader reviews', async () => {
+  await withStore(async store => {
+    await createTeam(store)
+    await store.addMember({
+      name: 'developer',
+      role: 'teammate',
+      joinedAt: new Date().toISOString(),
+      status: 'running',
+    })
+    const task = await store.addTask({
+      subject: 'Implement feature',
+      description: 'Complete the feature end to end',
+      owner: 'developer',
+    })
+    await store.updateTask(task.id, { status: 'in_progress', progressNote: 'Started implementation.' })
+    const startedAt = Date.parse((await store.read())!.tasks[0]!.lastProgressAt!)
+    const first = await store.checkTaskProgress({
+      taskId: task.id,
+      intervalMs: 5 * 60_000,
+      maxStalledChecks: 2,
+      now: startedAt + 5 * 60_000,
+    })
+    assert.equal(first.status, 'remind')
+    assert.equal(first.task.stalledCheckCount, 1)
+    const second = await store.checkTaskProgress({
+      taskId: task.id,
+      intervalMs: 5 * 60_000,
+      maxStalledChecks: 2,
+      now: startedAt + 10 * 60_000,
+    })
+    assert.equal(second.status, 'decompose')
+    assert.equal(second.task.stalledCheckCount, 2)
+    assert.ok(second.task.decompositionRequestedAt)
+    const repeated = await store.checkTaskProgress({
+      taskId: task.id,
+      intervalMs: 5 * 60_000,
+      maxStalledChecks: 2,
+      now: startedAt + 15 * 60_000,
+    })
+    assert.equal(repeated.status, 'already_escalated')
+    await store.updateTask(task.id, { progressNote: 'Added a focused implementation step.' })
+    const progressed = await store.checkTaskProgress({
+      taskId: task.id,
+      intervalMs: 5 * 60_000,
+      maxStalledChecks: 2,
+      now: Date.now(),
+    })
+    assert.equal(progressed.status, 'active')
+    assert.equal(progressed.task.stalledCheckCount, 0)
+  })
+})
+
 test('serializes concurrent task creation without reusing IDs', async () => {
   await withStore(async store => {
     await createTeam(store)

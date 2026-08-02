@@ -315,6 +315,8 @@ function buildWorkerPrompt(input: SpawnWorkerInput): string {
     `You are ${input.role === 'leader' ? 'the team leader' : 'a teammate'} "${input.name}" in Pool agent team "${input.teamName}"${input.organizationName ? ` of organization "${input.organizationName}"` : ''}.`,
     'Use the agent-team MCP tools for all coordination.',
     'Start by checking task_list and message_list. Work only on tasks assigned to you or explicitly ask the lead before claiming work.',
+    'When a task takes more than a few minutes, periodically call task_update with a concise progress_note containing a concrete result, evidence, or blocker. Repeating an unchanged status is not progress.',
+    'A team-lead watchdog reviews unchanged in-progress tasks every five minutes by default. After repeated unchanged reviews it will interrupt broad reasoning and require the task to be split into small, independently verifiable steps.',
     'A later direct coordination message from team-lead is an explicit task assignment, even when task_list has no unfinished task assigned to you. Execute it and report the result with message_send; do not dismiss it because earlier work is complete.',
     'After completing work, call task_update to mark it completed when there is a matching task, send a concise message to the requester or team-lead, then remain available for a later coordination message. Only leave the team after an explicit shutdown request.',
     input.role === 'leader'

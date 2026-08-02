@@ -42,6 +42,16 @@ export interface TeamTask {
   blockedBy: string[]
   createdAt: string
   updatedAt: string
+  /** Last timestamp at which the owner recorded a material task update. */
+  lastProgressAt?: string
+  /** Optional concise evidence supplied with the last material task update. */
+  lastProgressNote?: string
+  /** Consecutive leader watchdog checks with no recorded progress. */
+  stalledCheckCount?: number
+  /** Timestamp of the most recent no-progress watchdog check. */
+  lastStallCheckedAt?: string
+  /** Set once the watchdog has asked the owner to decompose the task. */
+  decompositionRequestedAt?: string
 }
 
 export interface TeamMessage {
@@ -75,6 +85,10 @@ export interface TeamState {
     leaderPid?: number
     heartbeatAt?: string
     watchdogPid?: number
+    /** How often the leader watchdog reviews in-progress teammate tasks. */
+    progressCheckIntervalMinutes?: number
+    /** Consecutive unchanged reviews before a task must be decomposed. */
+    maxStalledChecks?: number
   }
   nextTaskNumber: number
   nextMessageNumber: number

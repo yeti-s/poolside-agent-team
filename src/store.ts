@@ -13,6 +13,13 @@ const LOCK_RETRY_MS = 25
 const LOCK_TIMEOUT_MS = 5_000
 export const DEFAULT_MAX_MEMBERS = 4
 export const LEADER_HEARTBEAT_TIMEOUT_MS = 8_000
+export const DEFAULT_PROGRESS_CHECK_INTERVAL_MINUTES = 5
+export const DEFAULT_MAX_STALLED_CHECKS = 2
+
+export interface TaskProgressCheck {
+  task: TeamTask
+  status: 'active' | 'remind' | 'decompose' | 'already_escalated'
+}
 
 export class TeamError extends Error {}
 
@@ -57,6 +64,8 @@ export class TeamStore {
     tmuxSession: string
     leaderPid: number
     leaderName?: string
+    progressCheckIntervalMinutes?: number
+    maxStalledChecks?: number
   }): Promise<TeamState> {
     return this.mutate(async current => {
       if (current) throw new TeamError(`team "${current.team.name}" already exists`)
@@ -72,6 +81,8 @@ export class TeamStore {
           tmuxSession: input.tmuxSession,
           leaderPid: input.leaderPid,
           heartbeatAt: now,
+          progressCheckIntervalMinutes: input.progressCheckIntervalMinutes ?? DEFAULT_PROGRESS_CHECK_INTERVAL_MINUTES,
+          maxStalledChecks: input.maxStalledChecks ?? DEFAULT_MAX_STALLED_CHECKS,
         },
         nextTaskNumber: 1,
         nextMessageNumber: 1,
@@ -177,6 +188,8 @@ export class TeamStore {
         blockedBy: [],
         createdAt: now,
         updatedAt: now,
+        lastProgressAt: now,
+        lastProgressNote: 'Task created',
       }
       state.tasks.push(created)
       for (const blockedTaskId of blocks) {
@@ -196,6 +209,7 @@ export class TeamStore {
       status?: TaskStatus
       owner?: string | null
       blocks?: string[]
+      progressNote?: string
     },
   ): Promise<TeamTask> {
     let updated!: TeamTask
@@ -203,6 +217,7 @@ export class TeamStore {
       const state = requireTeam(current)
       const task = getTask(state, id)
       if (input.owner !== undefined && input.owner !== null) assertMember(state, input.owner)
+      const previous = structuredClone(task)
       if (input.blocks) {
         if (input.blocks.includes(id)) throw new TeamError('a task cannot block itself')
         assertTaskIds(state, input.blocks)
@@ -228,7 +243,22 @@ export class TeamStore {
         }
       }
       if (input.owner !== undefined) task.owner = input.owner ?? undefined
-      task.updatedAt = new Date().toISOString()
+      const now = new Date().toISOString()
+      task.updatedAt = now
+      const progressNote = input.progressNote?.trim()
+      const madeProgress = Boolean(progressNote)
+        || task.subject !== previous.subject
+        || task.description !== previous.description
+        || task.status !== previous.status
+        || task.owner !== previous.owner
+        || JSON.stringify(task.blocks) !== JSON.stringify(previous.blocks)
+      if (madeProgress) {
+        task.lastProgressAt = now
+        task.lastProgressNote = progressNote ?? task.lastProgressNote
+        task.stalledCheckCount = 0
+        task.lastStallCheckedAt = undefined
+        task.decompositionRequestedAt = undefined
+      }
       updated = structuredClone(task)
       return state
     })
@@ -262,6 +292,46 @@ export class TeamStore {
       return state
     })
     return created
+  }
+
+  /**
+   * Record one leader watchdog review. A task is escalated only once per
+   * unchanged stretch; a material task update resets its stall counter.
+   */
+  async checkTaskProgress(input: {
+    taskId: string
+    intervalMs: number
+    maxStalledChecks: number
+    now?: number
+  }): Promise<TaskProgressCheck> {
+    let result!: TaskProgressCheck
+    await this.mutate(current => {
+      const state = requireTeam(current)
+      const task = getTask(state, input.taskId)
+      const now = input.now ?? Date.now()
+      const progressAt = Date.parse(task.lastProgressAt ?? task.updatedAt)
+      if (!Number.isFinite(progressAt) || now - progressAt < input.intervalMs) {
+        result = { task: structuredClone(task), status: 'active' }
+        return state
+      }
+      const lastCheckAt = Date.parse(task.lastStallCheckedAt ?? '')
+      task.stalledCheckCount = Number.isFinite(lastCheckAt) && lastCheckAt >= progressAt
+        ? (task.stalledCheckCount ?? 0) + 1
+        : 1
+      task.lastStallCheckedAt = new Date(now).toISOString()
+      if (task.stalledCheckCount >= input.maxStalledChecks) {
+        if (!task.decompositionRequestedAt) {
+          task.decompositionRequestedAt = task.lastStallCheckedAt
+          result = { task: structuredClone(task), status: 'decompose' }
+        } else {
+          result = { task: structuredClone(task), status: 'already_escalated' }
+        }
+      } else {
+        result = { task: structuredClone(task), status: 'remind' }
+      }
+      return state
+    })
+    return result
   }
 
   async messagesFor(name: string, markRead: boolean): Promise<TeamMessage[]> {
@@ -388,6 +458,8 @@ function normalizeState(raw: unknown): TeamState {
       lead: state.team.lead ?? 'team-lead',
       maxMembers,
       tmuxSession,
+      progressCheckIntervalMinutes: state.team.progressCheckIntervalMinutes ?? DEFAULT_PROGRESS_CHECK_INTERVAL_MINUTES,
+      maxStalledChecks: state.team.maxStalledChecks ?? DEFAULT_MAX_STALLED_CHECKS,
     } as TeamState['team'],
   }
 }

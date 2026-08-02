@@ -18,6 +18,8 @@ export interface PlannedTeam {
   leader: PlannedTeammate
   teammates: PlannedTeammate[]
   maxMembers: number
+  progressCheckIntervalMinutes?: number
+  maxStalledChecks?: number
 }
 
 export interface OrganizationPlan {
@@ -221,6 +223,8 @@ export function normalizePlan(input: {
     leader: PlannedTeammate
     teammates?: PlannedTeammate[]
     maxMembers?: number
+    progressCheckIntervalMinutes?: number
+    maxStalledChecks?: number
   }>
 }): Omit<OrganizationPlan, 'id' | 'createdAt'> {
   const organizationName = sanitizeTeamName(input.organizationName)
@@ -241,7 +245,15 @@ export function normalizePlan(input: {
     if (!Number.isInteger(maxMembers) || maxMembers < memberNames.size || maxMembers > 64) {
       throw new TeamError(`team "${name}" max_members must be between its initial member count and 64`)
     }
-    return { name, description: raw.description?.trim(), leader, teammates, maxMembers }
+    return {
+      name,
+      description: raw.description?.trim(),
+      leader,
+      teammates,
+      maxMembers,
+      progressCheckIntervalMinutes: raw.progressCheckIntervalMinutes,
+      maxStalledChecks: raw.maxStalledChecks,
+    }
   })
   return { organizationName, description: input.description?.trim(), teams }
 }

@@ -5,6 +5,8 @@ import { readFileSync } from 'node:fs'
 import { z } from 'zod'
 import {
   DEFAULT_MAX_MEMBERS,
+  DEFAULT_MAX_STALLED_CHECKS,
+  DEFAULT_PROGRESS_CHECK_INTERVAL_MINUTES,
   TeamError,
   TeamStore,
   assertMember,
@@ -52,7 +54,11 @@ const taskStatus = z.enum(TASK_STATUSES)
 const messageKind = z.enum(MESSAGE_KINDS)
 const maxMembers = z.number().int().min(1).max(64)
 const recoveryMessage = z.string().trim().min(1).max(20_000)
+const progressCheckIntervalMinutes = z.number().int().min(1).max(60)
+const maxStalledChecks = z.number().int().min(1).max(10)
 let heartbeatTimer: NodeJS.Timeout | undefined
+let progressMonitorTimer: NodeJS.Timeout | undefined
+let progressMonitorInProgress = false
 let leaderSessionForExit: string | undefined
 let cleanupInProgress = false
 
@@ -108,6 +114,82 @@ function buildMessagePrompt(from: string, message: string, kind: MessageKind, fr
       : `This ${kind} message requires a response. Check whether it affects your assigned work, then act on the relevant request.`,
     'Check task_list and message_list, perform the requested work, then send a concise completion or blocker report back to the sender with message_send.',
   ].join('\n')
+}
+
+function progressReminderPrompt(task: { id: string, subject: string }, intervalMinutes: number): string {
+  return [
+    `Automated team-lead progress review: task #${task.id} "${task.subject}" has no recorded material progress for ${intervalMinutes} minutes.`,
+    'Immediately record a concise, concrete progress note or blocker with task_update, then send the same status to team-lead with message_send.',
+    'Do not continue silent/open-ended reasoning. If blocked, state the exact missing input or failed approach.',
+  ].join('\n')
+}
+
+function decompositionPrompt(task: { id: string, subject: string }, intervalMinutes: number, checks: number): string {
+  return [
+    `Automated team-lead escalation: task #${task.id} "${task.subject}" remained unchanged across ${checks} consecutive ${intervalMinutes}-minute reviews.`,
+    'Stop the current unproductive reasoning now. Break this work into 2-4 small, independently verifiable steps.',
+    'Create or update shared tasks for those steps, include concrete acceptance criteria, and begin only the smallest next step. Record the decomposition/progress with task_update and report it to team-lead with message_send.',
+    'Do not resume broad analysis of the original task until the smaller next step has a result or a specific blocker.',
+  ].join('\n')
+}
+
+async function runLeaderProgressMonitor(): Promise<void> {
+  if (progressMonitorInProgress) return
+  progressMonitorInProgress = true
+  try {
+    const state = await store.read()
+    if (!state || state.team.lead !== callerName()) return
+    const intervalMinutes = state.team.progressCheckIntervalMinutes ?? DEFAULT_PROGRESS_CHECK_INTERVAL_MINUTES
+    const intervalMs = intervalMinutes * 60_000
+    const maxChecks = state.team.maxStalledChecks ?? DEFAULT_MAX_STALLED_CHECKS
+    const members = new Map(state.members.map(member => [member.name, member]))
+    for (const task of state.tasks) {
+      if (task.status !== 'in_progress' || !task.owner) continue
+      const owner = members.get(task.owner)
+      if (!owner || owner.role !== 'teammate' || !owner.tmuxPaneId || !(await isTmuxPaneAlive(owner.tmuxPaneId))) continue
+      const review = await store.checkTaskProgress({
+        taskId: task.id,
+        intervalMs,
+        maxStalledChecks: maxChecks,
+      })
+      if (review.status === 'active' || review.status === 'already_escalated') continue
+      const prompt = review.status === 'decompose'
+        ? decompositionPrompt(review.task, intervalMinutes, review.task.stalledCheckCount ?? maxChecks)
+        : progressReminderPrompt(review.task, intervalMinutes)
+      await store.addMessage({
+        from: state.team.lead,
+        to: owner.name,
+        body: prompt,
+        messageKind: 'task',
+        requiresResponse: true,
+      })
+      // A decomposition request must preempt an endless thinking turn before
+      // the instruction is entered into the interactive Pool session.
+      if (review.status === 'decompose') {
+        await interruptTmuxPane(owner.tmuxPaneId).catch(() => undefined)
+      }
+      await sendPromptToTmuxPane(owner.tmuxPaneId, prompt)
+    }
+  } catch {
+    // Monitoring is best effort. Subsequent intervals retry transient tmux or
+    // state-lock failures without disrupting the leader session.
+  } finally {
+    progressMonitorInProgress = false
+  }
+}
+
+async function startLeaderProgressMonitor(): Promise<void> {
+  if (progressMonitorTimer) return
+  const state = await store.read()
+  if (!state || state.team.lead !== callerName()) return
+  const intervalMinutes = state.team.progressCheckIntervalMinutes ?? DEFAULT_PROGRESS_CHECK_INTERVAL_MINUTES
+  progressMonitorTimer = setInterval(() => { void runLeaderProgressMonitor() }, intervalMinutes * 60_000)
+  progressMonitorTimer.unref()
+}
+
+function stopLeaderProgressMonitor(): void {
+  if (progressMonitorTimer) clearInterval(progressMonitorTimer)
+  progressMonitorTimer = undefined
 }
 
 async function resumeMember(name: string, message?: string) {
@@ -182,6 +264,7 @@ async function cleanupLeaderTeam(): Promise<void> {
   cleanupInProgress = true
   if (heartbeatTimer) clearInterval(heartbeatTimer)
   heartbeatTimer = undefined
+  stopLeaderProgressMonitor()
   try {
     const state = await store.read()
     if (!state || state.team.leaderPid !== process.ppid) return
@@ -229,6 +312,8 @@ const plannedTeam = z.object({
   leader: plannedMember.describe('Every team must define exactly one team leader.'),
   teammates: z.array(plannedMember).optional(),
   max_members: maxMembers.optional(),
+  progress_check_interval_minutes: progressCheckIntervalMinutes.optional(),
+  stalled_check_limit: maxStalledChecks.optional(),
 })
 
 server.tool(
@@ -261,6 +346,8 @@ server.tool(
             model: member.model,
           })),
           maxMembers: team.max_members,
+          progressCheckIntervalMinutes: team.progress_check_interval_minutes,
+          maxStalledChecks: team.stalled_check_limit,
         })),
       }))
       return {
@@ -272,6 +359,8 @@ server.tool(
           leader: team.leader.name,
           initial_members: 1 + team.teammates.length,
           max_members: team.maxMembers,
+          progress_check_interval_minutes: team.progressCheckIntervalMinutes ?? DEFAULT_PROGRESS_CHECK_INTERVAL_MINUTES,
+          stalled_check_limit: team.maxStalledChecks ?? DEFAULT_MAX_STALLED_CHECKS,
         })),
         estimated_pool_sessions: plan.teams.reduce((total, team) => total + 1 + team.teammates.length, 0),
         approval_rules: [
@@ -311,6 +400,8 @@ server.tool(
             tmuxSession: session,
             leaderPid: process.ppid,
             leaderName: team.leader.name,
+            progressCheckIntervalMinutes: team.progressCheckIntervalMinutes,
+            maxStalledChecks: team.maxStalledChecks,
           })
           await createTeamTmuxSession({
             session,
@@ -442,14 +533,16 @@ server.tool(
 
 server.tool(
   'team_create',
-  'Create a shared Pool agent team and its task/message state.',
+  'Create a shared Pool agent team and its task/message state. The leader watchdog checks in-progress teammate tasks every five minutes by default, then interrupts and requires decomposition after two unchanged checks.',
   {
     team_name: nonEmpty.describe('A unique, filesystem-safe team name.'),
     description: nonEmpty.optional(),
     leader_name: z.literal('team-lead').describe('Required leader for a standalone team. The creating Pool session is team-lead.'),
     max_members: maxMembers.optional().describe('Maximum team size including team-lead. Defaults to 4.'),
+    progress_check_interval_minutes: progressCheckIntervalMinutes.optional().describe('Leader watchdog review cadence. Defaults to 5 minutes.'),
+    stalled_check_limit: maxStalledChecks.optional().describe('Unchanged reviews before automatic interrupt and task decomposition. Defaults to 2.'),
   },
-  async ({ team_name, description, max_members }) =>
+  async ({ team_name, description, max_members, progress_check_interval_minutes, stalled_check_limit }) =>
     execute(async () => {
       if (isOrganizationWorker()) throw new TeamError('create additional teams through an approved organization plan')
       if (callerName() !== 'team-lead') throw new TeamError('a teammate cannot create a team')
@@ -473,6 +566,8 @@ server.tool(
         tmuxSession,
         leaderPid: process.ppid,
         leaderName: 'team-lead',
+        progressCheckIntervalMinutes: progress_check_interval_minutes,
+        maxStalledChecks: stalled_check_limit,
       })
       try {
         await createTeamTmuxSession({
@@ -490,12 +585,15 @@ server.tool(
       }
       leaderSessionForExit = tmuxSession
       startLeaderHeartbeat()
+      await startLeaderProgressMonitor()
       return {
         team_name: state.team.name,
         state_path: store.statePath,
         lead_agent: state.team.lead,
         max_members: state.team.maxMembers,
         tmux_session: tmuxSession,
+        progress_check_interval_minutes: state.team.progressCheckIntervalMinutes,
+        stalled_check_limit: state.team.maxStalledChecks,
       }
     }),
 )
@@ -527,6 +625,7 @@ server.tool(
       })
       leaderSessionForExit = state.team.tmuxSession
       startLeaderHeartbeat()
+      await startLeaderProgressMonitor()
       return {
         adopted: true,
         tmux_session: state.team.tmuxSession,
@@ -637,8 +736,9 @@ server.tool(
     status: taskStatus.optional(),
     owner: nonEmpty.nullable().optional().describe('Teammate name; pass null to clear.'),
     blocks: z.array(nonEmpty).optional(),
+    progress_note: nonEmpty.optional().describe('Concrete result, evidence, or blocker. Resets the leader progress-watchdog timer.'),
   },
-  async ({ task_id, subject, description, status, owner, blocks }) =>
+  async ({ task_id, subject, description, status, owner, blocks, progress_note }) =>
     execute(async () => {
       await requireCaller()
       if (status === 'in_progress' && owner === undefined) {
@@ -652,6 +752,7 @@ server.tool(
         status: status as TaskStatus | undefined,
         owner,
         blocks,
+        progressNote: progress_note,
       })
     }),
 )
@@ -792,9 +893,11 @@ server.tool(
       await store.remove()
       if (heartbeatTimer) clearInterval(heartbeatTimer)
       heartbeatTimer = undefined
+      stopLeaderProgressMonitor()
       leaderSessionForExit = undefined
       return { deleted: true, team_name: state.team.name }
     }),
 )
 
 await server.connect(new StdioServerTransport())
+void startLeaderProgressMonitor()
