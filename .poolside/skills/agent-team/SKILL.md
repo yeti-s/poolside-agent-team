@@ -1,97 +1,45 @@
 ---
 name: agent-team
-description: Coordinate a Pool CLI team when a task benefits from parallel research, implementation, or testing. Use for creating a team, assigning shared tasks, communicating with teammates, and closing a team.
+description: Coordinate a Pool CLI team for independent research, implementation, or testing work.
 ---
 
 # Pool agent team
 
-Use the `agent-team` MCP tools to coordinate parallel Pool workers. Create a
-team only when the work has independent parts that benefit from concurrent
-execution.
+Use this only when work has independent parts that benefit from parallel Pool
+workers. All teammates share one workspace, so avoid overlapping file edits.
+
+## Team workflow
+
+1. The lead calls `team_create` once (`leader_name: "team-lead"`; default
+   `max_members` is 4 including the lead), then creates narrow tasks.
+2. Set `owner` when creating or updating a task. This immediately prompts a
+   live teammate. Use `depends_on` for prerequisites; `blocks` is legacy and
+   has the inverse meaning.
+3. Start independent workers with `team_spawn`, then use `task_update` and
+   `message_send` for assignments, decisions, and blockers. `fyi` and `ack`
+   messages do not interrupt a worker.
+4. Workers record material results or blockers with
+   `task_update.progress_note`, complete their task, report to the lead, and
+   remain available. `team_status` distinguishes a live pane from assigned
+   work and lists unassigned tasks.
+5. The lead watchdog checks unchanged in-progress work every 5 minutes by
+   default. After two unchanged checks it interrupts the turn and requires
+   2–4 smaller, verifiable steps. Configure this only when needed with
+   `progress_check_interval_minutes` and `stalled_check_limit`.
+6. Use `team_resume` for a stopped worker, `team_interrupt` only as the lead,
+   `team_request_shutdown` for cooperative exit, and `team_delete` to stop a
+   team. After restarting the lead CLI, call `team_adopt` before coordination.
 
 ## Organization workflow
 
-Use an Organization when multiple independent teams must coordinate. An
-Organization is expensive because it starts a separate tmux session and Pool
-agents for every planned team.
+Use an organization only for multiple independent teams. Call
+`organization_plan`, show the complete plan and exact approval phrase to the
+user, then call `organization_approve` only after a later verbatim approval.
+Team members communicate only within their team; team leads use
+`organization_message_send` for cross-team coordination.
 
-1. Call `organization_plan` with the complete team list. Every team must have
-   exactly one `leader` with a name and concrete prompt; include any initial
-   teammates in that team's list.
-2. Present the returned `plan_id`, team names, team leads, estimated Pool
-   session count, and `required_user_approval` statement to the user. Stop
-   there; do not call `organization_approve` in the same turn.
-3. Only after a later user message contains the exact
-   `required_user_approval` statement, call `organization_approve` with the
-   plan ID and a verbatim copy of that statement. Never infer, paraphrase,
-   generate, or claim approval on the user's behalf. This starts one tmux
-   session per team.
-4. A teammate may use tasks and `message_send` only within its own team. Never
-   attempt to name, inspect, or contact a member in another team.
-5. A team lead may use `organization_message_send` only to share an opinion
-   with another team lead. Do not use it to contact another team's teammate.
-6. Use `organization_status` for organization-level status and
-   `organization_delete` only when the organization lead should stop every
-   team.
+## Safety
 
-## Workflow
-
-1. Call `team_create` once with a concise name, purpose, required
-   `leader_name: "team-lead"`, and optional `max_members`. The default is 4
-   concurrent members and the limit includes `team-lead`. The leader progress
-   watchdog checks live in-progress teammate tasks every 5 minutes by default;
-   configure `progress_check_interval_minutes` and `stalled_check_limit` only
-   when the work needs a different cadence.
-2. Break the work into small shared tasks with `task_create`; add blocking
-   task IDs when order matters.
-   If the leader Pool CLI was restarted while preserving an existing team, call
-   `team_adopt` first. Use `force: true` only to deliberately replace a still
-   running previous leader.
-3. Start one teammate per independent workstream with `team_spawn`. Give each
-   teammate a precise outcome and name it by role, such as `researcher` or
-   `tester`.
-4. Assign each task with `task_update`. Use teammate names, never internal IDs.
-5. While a task is in progress, record each material result, evidence, or
-   blocker through `task_update.progress_note`; a repeated unchanged status is
-   not progress. After a task, update its status and check `task_list` plus
-   `message_list` before claiming more work. An idle teammate can receive a
-   new task and is not necessarily finished.
-6. On the first unchanged watchdog review, report concrete progress or the
-   exact blocker. At the stalled-check limit (2 reviews by default), the
-   watchdog interrupts the teammate's current thinking turn and directs it to
-   split the task into 2–4 small, independently verifiable tasks before it
-   continues. The lead should review that decomposition and reassign work as
-   needed instead of allowing open-ended analysis to resume.
-7. Use `message_send` with `message_kind: task`, `handoff`, or `decision` for
-   decisions, blockers, and handoffs; these deliver a follow-up prompt to a
-   live teammate. Use `message_kind: fyi` for information and `ack` for a
-   short acknowledgement: they are recorded for `message_list` but do not
-   interrupt or restart recipients, so never reply to a closing greeting with
-   another `message_send`. If the team lead sends a response-required message
-   to a worker whose pane stopped unexpectedly, agent-team restores that worker
-   first and then delivers the message. A deliberately shutdown worker stays
-   queued.
-8. Call `team_status` before a critical handoff. Use `team_resume` when you
-   need to explicitly revive a stopped worker; it resumes the worker's saved
-   Pool session when available and otherwise starts a fresh recovery session.
-9. Use `tmux attach -t pool-team-<team-name>` to inspect live teammates. The
-   `team` window shows all teammate panes together; `team-status` shows shared
-   state. You can select a pane to give its Pool session an additional prompt,
-   or press `Esc` there to interrupt its current work.
-10. Only the lead can interrupt another teammate through `team_interrupt`; a
-   teammate must never attempt to interrupt another teammate. Ask finished
-   teammates to stop with `team_request_shutdown`. `team_delete` terminates
-   remaining teammate panes and removes team state.
-
-## Safety and ownership
-
-- The team lead creates and removes teams and starts teammates. A teammate must
-  not call `team_spawn` or `team_delete`.
-- Keep tasks narrow enough that two teammates do not edit the same files at the
-  same time. This implementation uses one shared workspace, not Git worktrees.
-- Workers run as interactive Pool sessions in Always Allow mode. Only create a
-  team in a trusted project and never ask a teammate to expose credentials or
-  modify systems outside the requested work.
-- A shutdown request is cooperative: finish or safely stop current work, read
-  the shutdown message, then exit. The leader Pool CLI owns the tmux session;
-  exiting the leader CLI terminates every teammate window automatically.
+Only the lead creates/removes teams and spawns workers. Workers run with
+`pool --mode always-allow`; use only in trusted projects and never request
+credentials or out-of-scope system changes.
