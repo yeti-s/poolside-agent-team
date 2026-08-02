@@ -21,7 +21,6 @@ test('serves agent-team tools through the MCP stdio protocol', async () => {
   let nextId = 1
   let buffered = ''
   let stderr = ''
-  let elicitationRequests = 0
 
   server.stdout.setEncoding('utf8')
   server.stdout.on('data', chunk => {
@@ -32,11 +31,6 @@ test('serves agent-team tools through the MCP stdio protocol', async () => {
       const line = buffered.slice(0, newline)
       buffered = buffered.slice(newline + 1)
       const message = JSON.parse(line) as Record<string, unknown>
-      if (message.method === 'elicitation/create' && typeof message.id === 'number') {
-        elicitationRequests += 1
-        server.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { action: 'decline' } })}\n`)
-        continue
-      }
       const id = message.id
       if (typeof id === 'number') pending.get(id)?.(message)
     }
@@ -60,7 +54,7 @@ test('serves agent-team tools through the MCP stdio protocol', async () => {
   try {
     const initialize = await request('initialize', {
       protocolVersion: '2025-11-25',
-      capabilities: { elicitation: {} },
+      capabilities: {},
       clientInfo: { name: 'agent-team-test', version: '1.0.0' },
     })
     assert.equal((initialize.result as { serverInfo: { name: string } }).serverInfo.name, 'pool-agent-team')
@@ -124,14 +118,14 @@ test('serves agent-team tools through the MCP stdio protocol', async () => {
     assert.equal(organizationPlanPayload.status, 'awaiting_user_approval')
     assert.equal(organizationPlanPayload.estimated_pool_sessions, 2)
 
-    const declinedApproval = await request('tools/call', {
+    assert.equal(organizationPlanPayload.required_user_approval, `APPROVE ORGANIZATION ${organizationPlanPayload.plan_id}`)
+    const rejectedApproval = await request('tools/call', {
       name: 'organization_approve',
-      arguments: { plan_id: organizationPlanPayload.plan_id },
+      arguments: { plan_id: organizationPlanPayload.plan_id, user_approval: 'APPROVE ORGANIZATION some-other-plan' },
     })
-    const declinedApprovalResult = declinedApproval.result as { isError?: boolean, content: Array<{ text: string }> }
-    assert.equal(declinedApprovalResult.isError, true)
-    assert.match(declinedApprovalResult.content[0]!.text, /not approved by the user/)
-    assert.equal(elicitationRequests, 1)
+    const rejectedApprovalResult = rejectedApproval.result as { isError?: boolean, content: Array<{ text: string }> }
+    assert.equal(rejectedApprovalResult.isError, true)
+    assert.match(rejectedApprovalResult.content[0]!.text, /user_approval must exactly match/)
   } finally {
     server.kill('SIGTERM')
     await once(server, 'exit')

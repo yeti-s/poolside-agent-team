@@ -18,13 +18,14 @@ agents for every planned team.
 1. Call `organization_plan` with the complete team list. Every team must have
    exactly one `leader` with a name and concrete prompt; include any initial
    teammates in that team's list.
-2. Present the returned `plan_id`, team names, team leads, and estimated Pool
-   session count to the user. Do not call `organization_approve` until the user
-   explicitly approves this exact list.
-3. Call `organization_approve` with the plan ID only after presenting the
-   plan. Pool displays an interactive confirmation form; wait for the user's
-   response. Do not claim or assume approval on the user's behalf. This starts
-   one tmux session per team only when the user accepts the form.
+2. Present the returned `plan_id`, team names, team leads, estimated Pool
+   session count, and `required_user_approval` statement to the user. Stop
+   there; do not call `organization_approve` in the same turn.
+3. Only after a later user message contains the exact
+   `required_user_approval` statement, call `organization_approve` with the
+   plan ID and a verbatim copy of that statement. Never infer, paraphrase,
+   generate, or claim approval on the user's behalf. This starts one tmux
+   session per team.
 4. A teammate may use tasks and `message_send` only within its own team. Never
    attempt to name, inspect, or contact a member in another team.
 5. A team lead may use `organization_message_send` only to share an opinion

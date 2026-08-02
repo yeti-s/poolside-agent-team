@@ -68,30 +68,13 @@ function organizationTmuxSessionName(org: string, team: string): string {
   return `pool-org-${sanitizeTeamName(org)}-team-${sanitizeTeamName(team)}`
 }
 
-async function requestOrganizationApproval(plan: Awaited<ReturnType<typeof organizationStore.getPlan>>): Promise<void> {
-  let result: { action: 'accept' | 'decline' | 'cancel', content?: Record<string, unknown> }
-  try {
-    result = await server.server.elicitInput({
-      mode: 'form',
-      message: `Start organization "${plan.organizationName}" with ${plan.teams.length} team(s) and ${plan.teams.reduce((total, team) => total + 1 + team.teammates.length, 0)} Pool agent session(s)?`,
-      requestedSchema: {
-        type: 'object',
-        properties: {
-          approve: {
-            type: 'boolean',
-            title: 'Start this organization',
-            description: 'Creates one tmux session per team and starts the planned Pool agents.',
-            default: false,
-          },
-        },
-        required: ['approve'],
-      },
-    })
-  } catch {
-    throw new TeamError('organization approval requires an interactive user confirmation, but this Pool client does not support it')
-  }
-  if (result.action !== 'accept' || result.content?.approve !== true) {
-    throw new TeamError('organization start was not approved by the user')
+function requiredOrganizationApproval(planId: string): string {
+  return `APPROVE ORGANIZATION ${planId}`
+}
+
+function assertConversationalApproval(planId: string, userApproval: string): void {
+  if (userApproval.trim() !== requiredOrganizationApproval(planId)) {
+    throw new TeamError(`user_approval must exactly match: ${requiredOrganizationApproval(planId)}`)
   }
 }
 
@@ -291,20 +274,30 @@ server.tool(
           max_members: team.maxMembers,
         })),
         estimated_pool_sessions: plan.teams.reduce((total, team) => total + 1 + team.teammates.length, 0),
+        approval_rules: [
+          'Show this complete plan to the user, then stop and ask for approval.',
+          'Do not call organization_approve in the same turn as organization_plan.',
+          'Only call organization_approve after a later user message contains the exact approval statement below.',
+          'Never create, infer, paraphrase, or claim the user approval statement on the user\'s behalf.',
+        ],
+        required_user_approval: requiredOrganizationApproval(plan.id),
       }
     }),
 )
 
 server.tool(
   'organization_approve',
-  'Request an interactive user confirmation, then start the exact planned organization only when the user approves. This creates tmux sessions and starts Pool agents.',
-  { plan_id: nonEmpty },
-  async ({ plan_id }) =>
+  'Start the exact planned organization only after a later user message explicitly provides the required approval statement. The agent must copy that user statement verbatim into user_approval; never infer or create approval. This creates tmux sessions and starts Pool agents.',
+  {
+    plan_id: nonEmpty,
+    user_approval: nonEmpty.describe('Copy the exact approval statement from the user message after the plan was shown.'),
+  },
+  async ({ plan_id, user_approval }) =>
     execute(async () => {
       if (isOrganizationWorker()) throw new TeamError('only organization-lead can approve an organization plan')
       if (await organizationStore.read()) throw new TeamError('an organization already exists in this project')
       const plan = await organizationStore.getPlan(plan_id)
-      await requestOrganizationApproval(plan)
+      assertConversationalApproval(plan.id, user_approval)
       await assertTmuxAvailable()
       const sessions = plan.teams.map(team => ({ name: team.name, tmuxSession: organizationTmuxSessionName(plan.organizationName, team.name) }))
       try {
