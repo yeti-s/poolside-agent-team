@@ -9,11 +9,33 @@ Use the `agent-team` MCP tools to coordinate parallel Pool workers. Create a
 team only when the work has independent parts that benefit from concurrent
 execution.
 
+## Organization workflow
+
+Use an Organization when multiple independent teams must coordinate. An
+Organization is expensive because it starts a separate tmux session and Pool
+agents for every planned team.
+
+1. Call `organization_plan` with the complete team list. Every team must have
+   exactly one `leader` with a name and concrete prompt; include any initial
+   teammates in that team's list.
+2. Present the returned `plan_id`, team names, team leads, and estimated Pool
+   session count to the user. Do not call `organization_approve` until the user
+   explicitly approves this exact list.
+3. After approval, call `organization_approve` with the plan ID and
+   `approved_by_user: true`. This starts one tmux session per team.
+4. A teammate may use tasks and `message_send` only within its own team. Never
+   attempt to name, inspect, or contact a member in another team.
+5. A team lead may use `organization_message_send` only to share an opinion
+   with another team lead. Do not use it to contact another team's teammate.
+6. Use `organization_status` for organization-level status and
+   `organization_delete` only when the organization lead should stop every
+   team.
+
 ## Workflow
 
-1. Call `team_create` once with a concise name, purpose, and optional
-   `max_members`. The default is 4 concurrent members and the limit includes
-   `team-lead`.
+1. Call `team_create` once with a concise name, purpose, required
+   `leader_name: "team-lead"`, and optional `max_members`. The default is 4
+   concurrent members and the limit includes `team-lead`.
 2. Break the work into small shared tasks with `task_create`; add blocking
    task IDs when order matters.
    If the leader Pool CLI was restarted while preserving an existing team, call
