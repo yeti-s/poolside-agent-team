@@ -38,6 +38,7 @@ import {
 } from './types.js'
 import { OrganizationStore, normalizePlan } from './organization.js'
 import { LifecycleStore, archiveOrganizationRuntime, archiveRuntimeDirectory, type TeardownKind } from './lifecycle.js'
+import { buildTeammateInstructions, buildTeamLeaderInstructions } from './agent-instructions.js'
 
 const projectRoot = process.env.POOL_AGENT_TEAM_PROJECT_ROOT || process.cwd()
 const organizationName = process.env.POOL_AGENT_ORGANIZATION
@@ -152,31 +153,6 @@ function buildTaskAssignmentMessage(task: { id: string, subject: string, descrip
     `You have been assigned task #${task.id}: ${task.subject}`,
     task.description,
     'Start with the smallest concrete step. Call task_update to mark the task in_progress and include a progress_note for each material result or blocker.',
-  ].join('\n\n')
-}
-
-function buildAgentInstructions(input: {
-  name: string
-  teamName: string
-  organizationName?: string
-  role: 'leader' | 'teammate'
-  rolePrompt: string
-}): string {
-  return [
-    `# ${input.role === 'leader' ? 'Team leader' : 'Teammate'} instructions`,
-    `You are ${input.role === 'leader' ? 'the team leader' : 'a teammate'} "${input.name}" in Pool agent team "${input.teamName}"${input.organizationName ? ` of organization "${input.organizationName}"` : ''}.`,
-    '## Workspace',
-    `This session starts in an agent-runtime directory. Perform all project inspection, edits, commands, and tests from the project workspace: ${projectRoot}`,
-    'Do not modify files outside that project workspace.',
-    '## Coordination',
-    'Use the agent-team MCP tools for all coordination. Do not begin work until a direct coordination message assigns work.',
-    'When a task takes more than a few minutes, periodically call task_update with a concise progress_note containing a concrete result, evidence, or blocker. Repeating an unchanged status is not progress.',
-    'After completing work, call task_update when there is a matching task and send a concise completion or blocker report to the requester or team-lead. Remain available until an explicit shutdown request.',
-    input.role === 'leader'
-      ? 'You are a coordination-only leader. After the main Pool CLI gives you the team objective, create and assign concrete tasks to every approved teammate before inspecting project files or taking any implementation action. Never write product source, run package installation or tests, scaffold an application, or generate implementation files. Manage approved members by assigning, updating, interrupting, decomposing, and finalizing work. When all tracked tasks are terminal, call team_finalize with concise outcome and evidence before broadcasting the completion summary. You cannot create, remove, or shut down teammates or delete the team. Use organization_message_send only for another team leader.'
-      : 'You cannot create teammates or delete the team. Do not communicate with members outside your own team. Work only on tasks assigned by the team-lead.',
-    '## Assigned role',
-    input.rolePrompt.trim(),
   ].join('\n\n')
 }
 
@@ -663,11 +639,11 @@ server.tool(
           const teamStore = organizationStore.teamStore(plan.organizationName, team.name)
           await spawnPoolWorker({
             name: team.leader.name,
-            prompt: buildAgentInstructions({
+            prompt: buildTeamLeaderInstructions({
               name: team.leader.name,
               teamName: team.name,
               organizationName: plan.organizationName,
-              role: 'leader',
+              projectRoot,
               rolePrompt: team.leader.prompt,
             }),
             teamName: team.name,
@@ -683,12 +659,13 @@ server.tool(
           for (const teammate of team.teammates) {
             await spawnPoolWorker({
               name: teammate.name,
-              prompt: buildAgentInstructions({
+              prompt: buildTeammateInstructions({
                 name: teammate.name,
                 teamName: team.name,
                 organizationName: plan.organizationName,
-                role: 'teammate',
+                projectRoot,
                 rolePrompt: teammate.prompt,
+                teamLead: team.leader.name,
               }),
               teamName: team.name,
               tmuxSession: session,
@@ -974,10 +951,10 @@ server.tool(
       await store.updateTeam(team => { team.watchdogPid = watchdogPid })
       await spawnPoolWorker({
         name: plan.leader.name,
-        prompt: buildAgentInstructions({
+        prompt: buildTeamLeaderInstructions({
           name: plan.leader.name,
           teamName: state.team.name,
-          role: 'leader',
+          projectRoot,
           rolePrompt: plan.leader.prompt,
         }),
         teamName: state.team.name,
@@ -993,11 +970,12 @@ server.tool(
       for (const teammate of plan.teammates) {
         await spawnPoolWorker({
           name: teammate.name,
-          prompt: buildAgentInstructions({
+          prompt: buildTeammateInstructions({
             name: teammate.name,
             teamName: state.team.name,
-            role: 'teammate',
+            projectRoot,
             rolePrompt: teammate.prompt,
+            teamLead: plan.leader.name,
           }),
           teamName: state.team.name,
           tmuxSession,
