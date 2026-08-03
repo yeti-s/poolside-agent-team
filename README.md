@@ -98,6 +98,7 @@ Active runtime is intentionally visible to Git and is archived only when the mai
   plans.json
   <team>/state.json
   <team>/<team>-<agent>/AGENTS.md
+  <team>/<team>-<agent>/.poolside/settings.local.yaml
   <team>/<team>-<agent>/<agent>.json
   <team>/<team>-<agent>/<agent>.session.json
   <team>/<team>-<agent>/<agent>.log
@@ -109,7 +110,7 @@ Active runtime is intentionally visible to Git and is archived only when the mai
   <team>/<team>-<agent>/...
 ```
 
-Each agent starts in its own runtime directory, where Pool loads its native `AGENTS.md`. That file and the member `prompt` saved in team state contain the same role instructions; they direct project work to the actual project root. `.poolside/agent-team-archive/` and `.poolside/agent-organization-archive/` are ignored and receive the complete terminated runtime.
+Each agent starts in its own runtime directory, where Pool loads its native `AGENTS.md` and a generated local MCP configuration. That configuration exposes only the agent-team tools appropriate to the agent's role: coordination and recovery tools to the team leader, and task/message tools to teammates. It does not expose main-CLI lifecycle tools. The instruction file and the member `prompt` saved in team state contain the same role instructions; they direct project work to the actual project root. `.poolside/agent-team-archive/` and `.poolside/agent-organization-archive/` are ignored and receive the complete terminated runtime.
 
 When Pool's model server disconnects, a pane can remain open at the interactive
 prompt even though its prior turn failed. `team_status` reports pane liveness;

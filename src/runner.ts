@@ -1,7 +1,7 @@
 import { execFile, spawn } from 'node:child_process'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { promisify } from 'node:util'
 import type { TeamStore } from './store.js'
 import type { TeamMember } from './types.js'
@@ -49,6 +49,57 @@ type WorkerConfig = SpawnWorkerInput & {
 }
 
 let workerLaunchQueue: Promise<void> = Promise.resolve()
+
+/** MCP tools deliberately available inside a team-lead Pool session. */
+export const TEAM_LEADER_MCP_TOOLS = [
+  'team_list',
+  'team_status',
+  'task_create',
+  'task_list',
+  'task_update',
+  'task_decompose',
+  'message_send',
+  'message_list',
+  'team_resume',
+  'team_interrupt',
+  'team_finalize',
+] as const
+
+const ORGANIZATION_TEAM_LEADER_MCP_TOOLS = ['organization_message_send'] as const
+
+/** MCP tools deliberately available inside a non-leader team member session. */
+export const TEAMMATE_MCP_TOOLS = [
+  'task_list',
+  'task_update',
+  'message_send',
+  'message_list',
+] as const
+
+export function mcpToolsForWorker(
+  role?: TeamMember['role'],
+  organizationName?: string,
+): readonly string[] {
+  if (role !== 'leader') return TEAMMATE_MCP_TOOLS
+  return organizationName
+    ? [...TEAM_LEADER_MCP_TOOLS, ...ORGANIZATION_TEAM_LEADER_MCP_TOOLS]
+    : TEAM_LEADER_MCP_TOOLS
+}
+
+function buildWorkerSettings(input: SpawnWorkerInput): string {
+  const mcpEntrypoint = fileURLToPath(new URL('./index.js', import.meta.url))
+  const enabledTools = mcpToolsForWorker(input.role, input.organizationName)
+  return [
+    'mcp_servers:',
+    '  agent-team:',
+    `    command: ${JSON.stringify('node')}`,
+    '    args:',
+    `      - ${JSON.stringify(mcpEntrypoint)}`,
+    `    cwd: ${JSON.stringify(input.projectRoot)}`,
+    '    enabled_tools:',
+    ...enabledTools.map(tool => `      - ${JSON.stringify(tool)}`),
+    '',
+  ].join('\n')
+}
 
 function tmuxCommand(): string {
   return process.env.POOL_AGENT_TEAM_TMUX_COMMAND || 'tmux'
@@ -142,6 +193,7 @@ async function spawnPoolWorkerSerial(
   const configPath = join(agentDirectory, `${input.name}.json`)
   const sessionIdPath = join(agentDirectory, `${input.name}.session.json`)
   const instructionsPath = join(agentDirectory, 'AGENTS.md')
+  const settingsPath = join(agentDirectory, '.poolside', 'settings.local.yaml')
   const workerEntrypoint = fileURLToPath(new URL('./worker.js', import.meta.url))
   const poolCommand = process.env.POOL_AGENT_TEAM_POOL_COMMAND || 'pool'
   const basePoolArgs = [
@@ -168,6 +220,8 @@ async function spawnPoolWorkerSerial(
   }
   await writeFile(sessionIdPath, JSON.stringify({ complete: false }), { mode: 0o600 })
   await writeFile(instructionsPath, input.prompt, { mode: 0o600 })
+  await mkdir(dirname(settingsPath), { recursive: true })
+  await writeFile(settingsPath, buildWorkerSettings(input), { mode: 0o600 })
   await writeFile(configPath, `${JSON.stringify(config)}\n`, { mode: 0o600 })
 
   const teamWindowTarget = `${input.tmuxSession}:${TEAM_WINDOW}`

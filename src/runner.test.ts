@@ -3,7 +3,14 @@ import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import test from 'node:test'
-import { interruptTmuxPane, sendPromptToTmuxPane, spawnPoolWorker } from './runner.js'
+import {
+  TEAM_LEADER_MCP_TOOLS,
+  TEAMMATE_MCP_TOOLS,
+  interruptTmuxPane,
+  mcpToolsForWorker,
+  sendPromptToTmuxPane,
+  spawnPoolWorker,
+} from './runner.js'
 import { TeamStore } from './store.js'
 
 async function waitFor(
@@ -62,11 +69,13 @@ test('starts interactive Pool workers in tiled panes of the team window', async 
     )
     const secondSpawned = await spawnPoolWorker(
       {
-        name: 'reviewer',
+        name: 'team-lead',
         teamName: 'feature-x',
         tmuxSession: 'pool-team-feature-x',
         prompt: 'Review the implementation.',
         projectRoot,
+        role: 'leader',
+        replaceExisting: true,
       },
       store,
     )
@@ -110,6 +119,22 @@ test('starts interactive Pool workers in tiled panes of the team window', async 
     assert.equal(config.agentName, 'metadata-agent')
     const instructions = await readFile(join(agentDirectory, 'AGENTS.md'), 'utf8')
     assert.equal(instructions, 'Run the test suite.')
+    const settings = await readFile(join(agentDirectory, '.poolside', 'settings.local.yaml'), 'utf8')
+    assert.match(settings, /mcp_servers:\n  agent-team:/)
+    assert.match(settings, /- ".*\/dist\/index\.js"/)
+    assert.match(settings, new RegExp(`cwd: ${JSON.stringify(projectRoot)}`))
+    for (const tool of TEAMMATE_MCP_TOOLS) assert.match(settings, new RegExp(`- ${JSON.stringify(tool)}`))
+    for (const tool of TEAM_LEADER_MCP_TOOLS) {
+      if (!TEAMMATE_MCP_TOOLS.includes(tool as typeof TEAMMATE_MCP_TOOLS[number])) {
+        assert.doesNotMatch(settings, new RegExp(`- ${JSON.stringify(tool)}`))
+      }
+    }
+    const leaderSettings = await readFile(
+      join(projectRoot, '.poolside', 'agent-team', 'feature-x', 'feature-x-team-lead', '.poolside', 'settings.local.yaml'),
+      'utf8',
+    )
+    for (const tool of TEAM_LEADER_MCP_TOOLS) assert.match(leaderSettings, new RegExp(`- ${JSON.stringify(tool)}`))
+    assert.doesNotMatch(leaderSettings, /organization_message_send/)
     assert.ok(await readFile(join(agentDirectory, 'tester.session.json'), 'utf8'))
     assert.equal((await store.read())?.members.find(member => member.name === 'tester')?.prompt, instructions)
 
@@ -122,4 +147,14 @@ test('starts interactive Pool workers in tiled panes of the team window', async 
     else process.env.POOL_AGENT_TEAM_SESSION_DISCOVERY_TIMEOUT_MS = previousDiscoveryTimeout
     await rm(projectRoot, { recursive: true, force: true })
   }
+})
+
+test('selects a role-scoped MCP tool allowlist for each worker', () => {
+  assert.deepEqual(mcpToolsForWorker('leader'), TEAM_LEADER_MCP_TOOLS)
+  assert.deepEqual(mcpToolsForWorker('teammate'), TEAMMATE_MCP_TOOLS)
+  assert.deepEqual(mcpToolsForWorker(), TEAMMATE_MCP_TOOLS)
+  assert.deepEqual(mcpToolsForWorker('leader', 'delivery'), [
+    ...TEAM_LEADER_MCP_TOOLS,
+    'organization_message_send',
+  ])
 })
