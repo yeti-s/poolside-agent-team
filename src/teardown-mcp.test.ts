@@ -68,6 +68,13 @@ test('main CLI requires a later approval before tearing down and archiving a sta
   try {
     await request('initialize', { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'teardown-test', version: '1.0.0' } })
     server.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })}\n`)
+    const delegatedStatus = await request('tools/call', { name: 'team_status', arguments: {} })
+    const delegatedStatusResult = delegatedStatus.result as { isError?: boolean, content: Array<{ text: string }> }
+    assert.equal(delegatedStatusResult.isError, true)
+    assert.match(delegatedStatusResult.content[0]!.text, /delegated coordination/)
+    const reportWhileRunning = await request('tools/call', { name: 'team_report', arguments: {} })
+    const reportPayload = JSON.parse((reportWhileRunning.result as { content: Array<{ text: string }> }).content[0]!.text)
+    assert.equal(reportPayload.status, 'awaiting_leader_report')
     const planned = await request('tools/call', { name: 'team_teardown_plan', arguments: {} })
     const payload = JSON.parse((planned.result as { content: Array<{ text: string }> }).content[0]!.text) as {
       teardown_id: string

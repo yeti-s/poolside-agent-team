@@ -41,6 +41,7 @@ build/Release
 node_modules/
 dist/
 .poolside/agent-team/
+.poolside/agent-team-archive/
 # Poolside project-local state and private overrides
 .poolside/settings.local.yaml
 .poolside/plans/

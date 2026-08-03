@@ -8,6 +8,7 @@ mcp_servers:
       - organization_plan
       - organization_approve
       - organization_status
+      - organization_report
       - organization_message_send
       - organization_teardown_plan
       - organization_teardown_approve

@@ -432,6 +432,9 @@ async function resumeMember(name: string, message?: string) {
 }
 
 async function requireCaller(): Promise<string> {
+  if (isMainPoolCli()) {
+    throw new TeamError('the main Pool CLI has delegated coordination to team-lead; wait for team_report instead of calling team member or task tools')
+  }
   const state = await currentState()
   const caller = callerName()
   assertMember(state, caller)
@@ -624,6 +627,10 @@ server.tool(
           status: 'running',
           organization: organization.organization,
           teams: organization.teams.map(team => ({ name: team.name, lead: team.lead, tmux_session: team.tmuxSession })),
+          main_handoff: {
+            status: 'awaiting_team_leader_reports',
+            instruction: 'Coordination is now owned by each team-lead. Do not call organization_status or team/member/task/message tools. Wait for leaders to finalize, then call organization_report to relay their reports to the user.',
+          },
         }
       } catch (error) {
         await Promise.all(sessions.map(item => killTeamTmuxSession(item.tmuxSession)))
@@ -635,15 +642,40 @@ server.tool(
 
 server.tool(
   'organization_status',
-  'Show the organization and its teams. Team workers can view only their own team entry.',
+  'Show the organization and its teams to organization workers. The main Pool CLI must wait for organization_report after delegation.',
   {},
   async () => execute(async () => {
+    if (isMainPoolCli()) throw new TeamError('the main Pool CLI has delegated coordination to team-leads; wait for organization_report instead of organization_status')
     const state = await organizationStore.read()
     if (!state) throw new TeamError('no organization exists in this project')
     const teams = isOrganizationWorker()
       ? state.teams.filter(team => team.name === organizationTeamName)
       : state.teams
     return { organization: state.organization, teams }
+  }),
+)
+
+server.tool(
+  'organization_report',
+  'Read finalized reports from all organization team-leads. Only the main Pool CLI may call this after delegating work.',
+  {},
+  async () => execute(async () => {
+    requireMainPoolCli()
+    const organization = await organizationStore.read()
+    if (!organization) throw new TeamError('no organization exists in this project')
+    const reports = await Promise.all(organization.teams.map(async team => {
+      const state = requireTeam(await organizationStore.teamStore(organization.organization.name, team.name).read())
+      return { team_name: team.name, leader: team.lead, final_report: state.team.finalReport ?? null }
+    }))
+    const pending = reports.filter(report => !report.final_report).map(report => report.team_name)
+    return pending.length > 0
+      ? {
+          status: 'awaiting_team_leader_reports',
+          organization_name: organization.organization.name,
+          pending_teams: pending,
+          instruction: 'Continue waiting. Do not send tasks or messages to organization teams; team-leads own coordination until they finalize.',
+        }
+      : { status: 'reported', organization_name: organization.organization.name, reports }
   }),
 )
 
@@ -821,7 +853,7 @@ server.tool(
 
 server.tool(
   'team_approve',
-  'Create the exact planned standalone team only after a later user message contains the required approval statement.',
+  'Create the exact planned standalone team only after a later user message contains the required approval statement, then delegate all team work to team-lead.',
   { plan_id: nonEmpty, user_approval: nonEmpty },
   async ({ plan_id, user_approval }) => execute(async () => {
     requireMainPoolCli()
@@ -872,7 +904,16 @@ server.tool(
       await store.remove()
       throw error
     }
-    return { status: 'running', team_name: state.team.name, tmux_session: tmuxSession, lead_agent: plan.leader.name }
+    return {
+      status: 'running',
+      team_name: state.team.name,
+      tmux_session: tmuxSession,
+      lead_agent: plan.leader.name,
+      main_handoff: {
+        status: 'awaiting_leader_report',
+        instruction: 'Team coordination is now exclusively owned by team-lead. Do not call team_status, team_list, team_adopt, task, or message tools. Wait until team-lead finalizes, then call team_report to relay the result to the user.',
+      },
+    }
   }),
 )
 
@@ -895,7 +936,7 @@ server.tool(
   async ({ force }) =>
     execute(async () => {
       if (isOrganizationWorker()) throw new TeamError('organization team leadership is managed by the organization')
-      if (isMainPoolCli()) throw new TeamError('the main Pool CLI does not adopt team leadership')
+      if (isMainPoolCli()) throw new TeamError('the main Pool CLI has delegated coordination to team-lead and cannot adopt leadership; wait for team_report')
       await requireLead()
       const state = await currentState()
       const previousLeaderPid = state.team.leaderPid
@@ -948,16 +989,20 @@ server.tool('team_status', 'Show worker-process liveness separately from each te
 
 server.tool(
   'team_report',
-  'Read the latest team outcome and task summary. Only the main Pool CLI may read the final report for user handoff.',
+  'Read the team-lead final outcome. Only the main Pool CLI may call this after it delegated team coordination.',
   {},
   async () => execute(async () => {
     requireMainPoolCli()
     const state = requireTeam(await store.read())
-    const task_summary = state.tasks.reduce<Record<string, number>>((summary, task) => {
-      summary[task.status] = (summary[task.status] ?? 0) + 1
-      return summary
-    }, {})
-    return { team: state.team, task_summary, final_report: state.team.finalReport ?? null }
+    if (!state.team.finalReport) {
+      return {
+        status: 'awaiting_leader_report',
+        team_name: state.team.name,
+        lead_agent: state.team.lead,
+        instruction: 'Continue waiting. Do not send tasks or messages to the team; team-lead owns coordination until it finalizes.',
+      }
+    }
+    return { status: 'reported', team_name: state.team.name, lead_agent: state.team.lead, final_report: state.team.finalReport }
   }),
 )
 
