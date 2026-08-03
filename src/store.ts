@@ -1,4 +1,4 @@
-import { mkdir, open, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { mkdir, open, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import type {
   PublicTeamStatus,
@@ -33,7 +33,7 @@ export interface PlannedTeamMember {
 export interface TeamCreationPlan {
   id: string
   teamName: string
-  description?: string
+  description: string
   leader: PlannedTeamMember
   teammates: PlannedTeamMember[]
   maxMembers: number
@@ -61,14 +61,52 @@ export function validateMemberName(name: string): string {
 }
 
 export class TeamStore {
-  readonly statePath: string
-  private readonly lockPath: string
+  private resolvedStatePath?: string
+  private readonly legacyStatePath: string
   private readonly planPath: string
 
   constructor(readonly projectRoot: string, statePath?: string) {
-    this.statePath = statePath ?? join(projectRoot, '.poolside', 'agent-team', 'state.json')
-    this.lockPath = join(dirname(this.statePath), 'state.lock')
-    this.planPath = join(dirname(this.statePath), 'plans.json')
+    this.resolvedStatePath = statePath
+    this.legacyStatePath = join(projectRoot, '.poolside', 'agent-team', 'state.json')
+    this.planPath = statePath
+      ? join(dirname(statePath), 'plans.json')
+      : join(projectRoot, '.poolside', 'agent-team', 'plans.json')
+  }
+
+  get statePath(): string {
+    return this.resolvedStatePath ?? this.legacyStatePath
+  }
+
+  private get lockPath(): string {
+    return join(dirname(this.statePath), 'state.lock')
+  }
+
+  private async resolveActiveStatePath(): Promise<void> {
+    if (this.resolvedStatePath) return
+    try {
+      await readFile(this.legacyStatePath, 'utf8')
+      return
+    } catch (error: unknown) {
+      if (!isNotFound(error)) throw error
+    }
+    const root = dirname(this.legacyStatePath)
+    try {
+      const entries = await readdir(root, { withFileTypes: true })
+      const teamDirectories = entries.filter(entry => entry.isDirectory()).map(entry => join(root, entry.name, 'state.json'))
+      const existing: string[] = []
+      for (const candidate of teamDirectories) {
+        try {
+          await readFile(candidate, 'utf8')
+          existing.push(candidate)
+        } catch (error: unknown) {
+          if (!isNotFound(error)) throw error
+        }
+      }
+      if (existing.length === 1) this.resolvedStatePath = existing[0]
+      if (existing.length > 1) throw new TeamError('multiple active standalone team states were found')
+    } catch (error: unknown) {
+      if (!isNotFound(error)) throw error
+    }
   }
 
   async createPlan(input: Omit<TeamCreationPlan, 'id' | 'createdAt'>): Promise<TeamCreationPlan> {
@@ -96,6 +134,7 @@ export class TeamStore {
   }
 
   async read(): Promise<TeamState | undefined> {
+    await this.resolveActiveStatePath()
     try {
       return normalizeState(JSON.parse(await readFile(this.statePath, 'utf8')))
     } catch (error: unknown) {
@@ -114,6 +153,9 @@ export class TeamStore {
     progressCheckIntervalMinutes?: number
     maxStalledChecks?: number
   }): Promise<TeamState> {
+    if (!this.resolvedStatePath) {
+      this.resolvedStatePath = join(this.projectRoot, '.poolside', 'agent-team', sanitizeTeamName(input.teamName), 'state.json')
+    }
     return this.mutate(async current => {
       if (current) throw new TeamError(`team "${current.team.name}" already exists`)
       const now = new Date().toISOString()
@@ -130,7 +172,6 @@ export class TeamStore {
           heartbeatAt: now,
           progressCheckIntervalMinutes: input.progressCheckIntervalMinutes ?? DEFAULT_PROGRESS_CHECK_INTERVAL_MINUTES,
           maxStalledChecks: input.maxStalledChecks ?? DEFAULT_MAX_STALLED_CHECKS,
-          initialAssignmentDeadlineAt: new Date(Date.now() + INITIAL_ASSIGNMENT_TIMEOUT_MS).toISOString(),
         },
         nextTaskNumber: 1,
         nextMessageNumber: 1,
@@ -151,6 +192,7 @@ export class TeamStore {
   async mutate(
     action: (current: TeamState | undefined) => Promise<TeamState> | TeamState,
   ): Promise<TeamState> {
+    await this.resolveActiveStatePath()
     const release = await this.acquireLock()
     try {
       const result = await action(await this.read())
@@ -165,12 +207,22 @@ export class TeamStore {
   }
 
   async remove(): Promise<void> {
+    await this.resolveActiveStatePath()
     const release = await this.acquireLock()
     try {
       await rm(dirname(this.statePath), { recursive: true, force: true })
     } finally {
       await release()
     }
+  }
+
+  /** Start leadership monitoring only after the main CLI has delivered the initial team objective. */
+  async beginWork(): Promise<TeamState> {
+    return this.updateTeam(team => {
+      if (!team.initialAssignmentDeadlineAt) {
+        team.initialAssignmentDeadlineAt = new Date(Date.now() + INITIAL_ASSIGNMENT_TIMEOUT_MS).toISOString()
+      }
+    })
   }
 
   private async readPlans(): Promise<TeamCreationPlan[]> {

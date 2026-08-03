@@ -44,6 +44,7 @@ test('creates one team and rejects a second active team', async () => {
     assert.equal(state.team.lead, 'team-lead')
     assert.equal(state.team.maxMembers, 4)
     assert.equal(state.members.length, 1)
+    assert.match(store.statePath, /\.poolside\/agent-team\/feature-x\/state\.json$/)
     await assert.rejects(() => createTeam(store, { teamName: 'other-team' }), TeamError)
   })
 })
@@ -53,6 +54,8 @@ test('requires every teammate to receive initial work before clearing the leader
     await createTeam(store)
     await store.addMember({ name: 'developer', role: 'teammate', joinedAt: new Date().toISOString(), status: 'idle' })
     await store.addMember({ name: 'tester', role: 'teammate', joinedAt: new Date().toISOString(), status: 'idle' })
+    assert.equal((await store.read())?.team.initialAssignmentDeadlineAt, undefined)
+    await store.beginWork()
     assert.ok((await store.read())?.team.initialAssignmentDeadlineAt)
     await store.addTask({ subject: 'Implement', description: 'Build the focused feature.', owner: 'developer' })
     assert.ok((await store.read())?.team.initialAssignmentDeadlineAt)
@@ -268,6 +271,7 @@ test('stores a team plan without creating team state', async () => {
   await withStore(async store => {
     const plan = await store.createPlan({
       teamName: 'planned-team',
+      description: 'Coordinate the approved work.',
       leader: { name: 'team-lead', prompt: 'Coordinate approved work.' },
       teammates: [{ name: 'developer', prompt: 'Implement focused work.' }],
       maxMembers: 2,

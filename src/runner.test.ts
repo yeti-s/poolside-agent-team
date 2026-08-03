@@ -91,27 +91,27 @@ test('starts interactive Pool workers in tiled panes of the team window', async 
     assert.equal(secondSpawned.tmuxWindow, 'team')
     assert.equal((await store.read())?.members.find(member => member.name === 'tester')?.tmuxWindow, 'team')
 
-    const config = JSON.parse(await readFile(join(projectRoot, '.poolside', 'agent-team', 'run', 'tester.json'), 'utf8')) as {
+    const agentDirectory = join(projectRoot, '.poolside', 'agent-team', 'feature-x', 'feature-x-tester')
+    const config = JSON.parse(await readFile(join(agentDirectory, 'tester.json'), 'utf8')) as {
       poolArgs: string[]
       agentName?: string
     }
-    assert.deepEqual(config.poolArgs.slice(0, 7), [
+    assert.deepEqual(config.poolArgs.slice(0, 5), [
       '--directory',
-      projectRoot,
+      agentDirectory,
       '--mode',
       'always-allow',
-      '--prompt-queue',
-      config.poolArgs[5]!,
       '--model',
     ])
-    assert.equal(config.poolArgs[7], 'laguna-test')
+    assert.equal(config.poolArgs[5], 'laguna-test')
     assert.ok(!config.poolArgs.includes('exec'))
     assert.ok(!config.poolArgs.includes('--agent-name'))
+    assert.ok(!config.poolArgs.includes('--prompt-queue'))
     assert.equal(config.agentName, 'metadata-agent')
-    assert.match(config.poolArgs[5]!, /direct coordination message from team-lead is an explicit task assignment/)
-    assert.match(config.poolArgs[5]!, /task_update with a concise progress_note/)
-    assert.match(config.poolArgs[5]!, /watchdog reviews unchanged in-progress tasks every five minutes/)
-    assert.match(config.poolArgs[5]!, /Only leave the team after an explicit shutdown request/)
+    const instructions = await readFile(join(agentDirectory, 'AGENTS.md'), 'utf8')
+    assert.equal(instructions, 'Run the test suite.')
+    assert.ok(await readFile(join(agentDirectory, 'tester.session.json'), 'utf8'))
+    assert.equal((await store.read())?.members.find(member => member.name === 'tester')?.prompt, instructions)
 
   } finally {
     if (previousCommand === undefined) delete process.env.POOL_AGENT_TEAM_TMUX_COMMAND

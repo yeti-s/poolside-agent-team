@@ -14,7 +14,7 @@ export interface PlannedTeammate {
 
 export interface PlannedTeam {
   name: string
-  description?: string
+  description: string
   leader: PlannedTeammate
   teammates: PlannedTeammate[]
   maxMembers: number
@@ -41,7 +41,7 @@ export interface OrganizationState {
   }
   teams: Array<{
     name: string
-    description?: string
+    description: string
     lead: string
     tmuxSession: string
     statePath: string
@@ -78,11 +78,11 @@ export class OrganizationStore {
   }
 
   teamStatePath(organizationName: string, teamName: string): string {
-    return join(this.directory, sanitizeTeamName(organizationName), 'teams', sanitizeTeamName(teamName), 'state.json')
+    return join(this.directory, sanitizeTeamName(teamName), 'state.json')
   }
 
   teamRuntimeDirectory(organizationName: string, teamName: string): string {
-    return join(this.directory, sanitizeTeamName(organizationName), 'teams', sanitizeTeamName(teamName))
+    return join(this.directory, sanitizeTeamName(teamName))
   }
 
   async read(): Promise<OrganizationState | undefined> {
@@ -161,7 +161,13 @@ export class OrganizationStore {
 
   async remove(): Promise<void> {
     await this.withLock(async () => {
-      await rm(this.directory, { recursive: true, force: true })
+      const state = await this.read()
+      await rm(this.statePath, { force: true })
+      if (state) {
+        await Promise.all(state.teams.map(team =>
+          rm(this.teamRuntimeDirectory(state.organization.name, team.name), { recursive: true, force: true }),
+        ))
+      }
     })
   }
 
@@ -234,6 +240,8 @@ export function normalizePlan(input: {
     const name = sanitizeTeamName(raw.name)
     if (names.has(name)) throw new TeamError(`duplicate team name "${name}" in organization plan`)
     names.add(name)
+    const description = raw.description?.trim()
+    if (!description) throw new TeamError(`team "${name}" description is required`)
     const leader = normalizeMember(raw.leader, 'team leader')
     const teammates = (raw.teammates ?? []).map(member => normalizeMember(member, 'teammate'))
     const memberNames = new Set([leader.name])
@@ -247,7 +255,7 @@ export function normalizePlan(input: {
     }
     return {
       name,
-      description: raw.description?.trim(),
+      description,
       leader,
       teammates,
       maxMembers,

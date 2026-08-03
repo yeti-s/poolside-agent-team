@@ -110,6 +110,27 @@ export async function archiveRuntimeDirectory(
   return archivePath
 }
 
+/** Archive only active organization state and team runtimes while retaining root plans.json. */
+export async function archiveOrganizationRuntime(input: {
+  projectRoot: string
+  organizationDirectory: string
+  organizationName: string
+  teamNames: string[]
+}): Promise<string> {
+  const archiveRoot = join(input.projectRoot, '.poolside', 'agent-organization-archive')
+  await mkdir(archiveRoot, { recursive: true })
+  const archivePath = join(
+    archiveRoot,
+    `${new Date().toISOString().replace(/[:.]/g, '-')}-${sanitizeTeamName(input.organizationName)}`,
+  )
+  await mkdir(archivePath, { recursive: true })
+  await rename(join(input.organizationDirectory, 'state.json'), join(archivePath, 'state.json'))
+  await Promise.all(input.teamNames.map(teamName =>
+    rename(join(input.organizationDirectory, sanitizeTeamName(teamName)), join(archivePath, sanitizeTeamName(teamName))),
+  ))
+  return archivePath
+}
+
 function isNotFound(error: unknown): error is NodeJS.ErrnoException {
   return typeof error === 'object' && error !== null && (error as NodeJS.ErrnoException).code === 'ENOENT'
 }

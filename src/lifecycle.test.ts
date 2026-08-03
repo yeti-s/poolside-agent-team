@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
-import { LifecycleStore, archiveRuntimeDirectory } from './lifecycle.js'
+import { LifecycleStore, archiveOrganizationRuntime, archiveRuntimeDirectory } from './lifecycle.js'
 
 test('persists teardown confirmation plans and archives terminated runtime state', async () => {
   const projectRoot = await mkdtemp(join(tmpdir(), 'pool-agent-lifecycle-'))
@@ -26,6 +26,32 @@ test('persists teardown confirmation plans and archives terminated runtime state
 
     await lifecycle.consume(plan.id)
     await assert.rejects(() => lifecycle.get(plan.id), /was not found/)
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true })
+  }
+})
+
+test('archives organization state and team runtimes while preserving plans', async () => {
+  const projectRoot = await mkdtemp(join(tmpdir(), 'pool-agent-organization-lifecycle-'))
+  try {
+    const runtime = join(projectRoot, '.poolside', 'agent-organization')
+    await mkdir(join(runtime, 'build'), { recursive: true })
+    await mkdir(join(runtime, 'quality'), { recursive: true })
+    await writeFile(join(runtime, 'plans.json'), '[]\n')
+    await writeFile(join(runtime, 'state.json'), '{"organization":"delivery"}\n')
+    await writeFile(join(runtime, 'build', 'state.json'), '{"team":"build"}\n')
+    await writeFile(join(runtime, 'quality', 'state.json'), '{"team":"quality"}\n')
+
+    const archivePath = await archiveOrganizationRuntime({
+      projectRoot,
+      organizationDirectory: runtime,
+      organizationName: 'delivery',
+      teamNames: ['build', 'quality'],
+    })
+    assert.match(archivePath, /agent-organization-archive/)
+    assert.equal(await readFile(join(archivePath, 'build', 'state.json'), 'utf8'), '{"team":"build"}\n')
+    assert.equal(await readFile(join(runtime, 'plans.json'), 'utf8'), '[]\n')
+    await assert.rejects(() => readFile(join(runtime, 'state.json'), 'utf8'))
   } finally {
     await rm(projectRoot, { recursive: true, force: true })
   }

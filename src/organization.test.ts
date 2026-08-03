@@ -15,11 +15,13 @@ test('plans an organization without creating Team state, then activates isolated
       teams: [
         {
           name: 'build',
+          description: 'Build the requested feature.',
           leader: { name: 'builder', prompt: 'Coordinate implementation.' },
           teammates: [{ name: 'coder', prompt: 'Implement the feature.' }],
         },
         {
           name: 'quality',
+          description: 'Validate the requested feature.',
           leader: { name: 'reviewer', prompt: 'Coordinate validation.' },
         },
       ],
@@ -45,6 +47,7 @@ test('plans an organization without creating Team state, then activates isolated
 
     const buildStore = organizations.teamStore('product-delivery', 'build')
     const qualityStore = organizations.teamStore('product-delivery', 'quality')
+    assert.match(buildStore.statePath, /\.poolside\/agent-organization\/build\/state\.json$/)
     await buildStore.addMember({ name: 'coder', role: 'teammate', joinedAt: new Date().toISOString(), status: 'idle' })
     await assert.rejects(
       () => buildStore.addMessage({ from: 'coder', to: 'reviewer', body: 'Can you review this?' }),
@@ -62,19 +65,20 @@ test('plans an organization without creating Team state, then activates isolated
 test('requires a leader and rejects duplicate team or member names in a plan', () => {
   assert.throws(() => normalizePlan({
     organizationName: 'test',
-    teams: [{ name: 'a', leader: undefined as never }],
+    teams: [{ name: 'a', description: 'Coordinate work.', leader: undefined as never }],
   }), /team leader is required/)
   assert.throws(() => normalizePlan({
     organizationName: 'test',
     teams: [
-      { name: 'a', leader: { name: 'lead', prompt: 'Lead.' } },
-      { name: 'a', leader: { name: 'other', prompt: 'Lead.' } },
+      { name: 'a', description: 'Coordinate work.', leader: { name: 'lead', prompt: 'Lead.' } },
+      { name: 'a', description: 'Coordinate other work.', leader: { name: 'other', prompt: 'Lead.' } },
     ],
   }), /duplicate team name/)
   assert.throws(() => normalizePlan({
     organizationName: 'test',
     teams: [{
       name: 'a',
+      description: 'Coordinate work.',
       leader: { name: 'lead', prompt: 'Lead.' },
       teammates: [{ name: 'lead', prompt: 'Duplicate.' }],
     }],

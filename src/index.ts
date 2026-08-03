@@ -1,5 +1,6 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
+import { rm } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { z } from 'zod'
 import {
@@ -36,7 +37,7 @@ import {
   type TaskStatus,
 } from './types.js'
 import { OrganizationStore, normalizePlan } from './organization.js'
-import { LifecycleStore, archiveRuntimeDirectory, type TeardownKind } from './lifecycle.js'
+import { LifecycleStore, archiveOrganizationRuntime, archiveRuntimeDirectory, type TeardownKind } from './lifecycle.js'
 
 const projectRoot = process.env.POOL_AGENT_TEAM_PROJECT_ROOT || process.cwd()
 const organizationName = process.env.POOL_AGENT_ORGANIZATION
@@ -154,16 +155,54 @@ function buildTaskAssignmentMessage(task: { id: string, subject: string, descrip
   ].join('\n\n')
 }
 
-function buildStandaloneLeaderPrompt(description?: string): string {
+function buildAgentInstructions(input: {
+  name: string
+  teamName: string
+  organizationName?: string
+  role: 'leader' | 'teammate'
+  rolePrompt: string
+}): string {
   return [
-    'Coordinate this team autonomously after the creating Pool session has created its initial members and tasks.',
-    description ? `Team objective: ${description}` : '',
-    'Whenever a teammate reports completion, blocker, handoff, or review result, immediately read message_list and task_list.',
-    'Turn each result into an explicit next task, validation task, review task, or a concise final outcome. Assign every task to a named teammate and use depends_on for prerequisites.',
-    'Do not leave teammates waiting after a completion report. Before declaring the team finished, confirm that every task is completed and that all completion/report messages have been handled.',
-    'When all tracked tasks are terminal, call team_finalize with the final outcome and evidence before sending a team-wide completion summary. A completion broadcast is only a fallback; team_finalize is the required report.',
-    'Do not create teammates unless the creating lead explicitly requests it; coordinate the members already present.',
-  ].filter(Boolean).join('\n\n')
+    `# ${input.role === 'leader' ? 'Team leader' : 'Teammate'} instructions`,
+    `You are ${input.role === 'leader' ? 'the team leader' : 'a teammate'} "${input.name}" in Pool agent team "${input.teamName}"${input.organizationName ? ` of organization "${input.organizationName}"` : ''}.`,
+    '## Workspace',
+    `This session starts in an agent-runtime directory. Perform all project inspection, edits, commands, and tests from the project workspace: ${projectRoot}`,
+    'Do not modify files outside that project workspace.',
+    '## Coordination',
+    'Use the agent-team MCP tools for all coordination. Do not begin work until a direct coordination message assigns work.',
+    'When a task takes more than a few minutes, periodically call task_update with a concise progress_note containing a concrete result, evidence, or blocker. Repeating an unchanged status is not progress.',
+    'After completing work, call task_update when there is a matching task and send a concise completion or blocker report to the requester or team-lead. Remain available until an explicit shutdown request.',
+    input.role === 'leader'
+      ? 'You are a coordination-only leader. After the main Pool CLI gives you the team objective, create and assign concrete tasks to every approved teammate before inspecting project files or taking any implementation action. Never write product source, run package installation or tests, scaffold an application, or generate implementation files. Manage approved members by assigning, updating, interrupting, decomposing, and finalizing work. When all tracked tasks are terminal, call team_finalize with concise outcome and evidence before broadcasting the completion summary. You cannot create, remove, or shut down teammates or delete the team. Use organization_message_send only for another team leader.'
+      : 'You cannot create teammates or delete the team. Do not communicate with members outside your own team. Work only on tasks assigned by the team-lead.',
+    '## Assigned role',
+    input.rolePrompt.trim(),
+  ].join('\n\n')
+}
+
+function initialLeaderWorkPrompt(description: string): string {
+  return [
+    'The main Pool CLI has completed creation of every approved team member.',
+    'Team objective:',
+    description,
+    'Act as team leader only: create and assign concrete initial tasks to every teammate, then manage their work to completion. Do not implement product work yourself.',
+  ].join('\n\n')
+}
+
+async function startApprovedTeamWork(targetStore: TeamStore, description: string): Promise<void> {
+  const state = requireTeam(await targetStore.read())
+  const leader = state.members.find(member => member.name === state.team.lead)
+  if (!leader?.tmuxPaneId) throw new TeamError(`team leader "${state.team.lead}" is not ready`)
+  const prompt = initialLeaderWorkPrompt(description)
+  await targetStore.addMessage({
+    from: 'system',
+    to: state.team.lead,
+    body: prompt,
+    kind: 'system',
+    requiresResponse: true,
+  })
+  await targetStore.beginWork()
+  await sendPromptToTmuxPane(leader.tmuxPaneId, prompt)
 }
 
 function finalizationReminderPrompt(): string {
@@ -513,7 +552,7 @@ const plannedMember = z.object({
 })
 const plannedTeam = z.object({
   name: nonEmpty,
-  description: nonEmpty.optional(),
+  description: nonEmpty.describe('Concrete initial work instruction delivered to the team leader after every approved member is ready.'),
   leader: plannedMember.describe('Every team must define exactly one team leader.'),
   teammates: z.array(plannedMember).optional(),
   max_members: maxMembers.optional(),
@@ -624,7 +663,13 @@ server.tool(
           const teamStore = organizationStore.teamStore(plan.organizationName, team.name)
           await spawnPoolWorker({
             name: team.leader.name,
-            prompt: team.leader.prompt,
+            prompt: buildAgentInstructions({
+              name: team.leader.name,
+              teamName: team.name,
+              organizationName: plan.organizationName,
+              role: 'leader',
+              rolePrompt: team.leader.prompt,
+            }),
             teamName: team.name,
             tmuxSession: session,
             projectRoot,
@@ -638,7 +683,13 @@ server.tool(
           for (const teammate of team.teammates) {
             await spawnPoolWorker({
               name: teammate.name,
-              prompt: teammate.prompt,
+              prompt: buildAgentInstructions({
+                name: teammate.name,
+                teamName: team.name,
+                organizationName: plan.organizationName,
+                role: 'teammate',
+                rolePrompt: teammate.prompt,
+              }),
               teamName: team.name,
               tmuxSession: session,
               projectRoot,
@@ -648,6 +699,12 @@ server.tool(
               model: teammate.model,
             }, teamStore)
           }
+        }
+        for (const team of plan.teams) {
+          await startApprovedTeamWork(
+            organizationStore.teamStore(plan.organizationName, team.name),
+            team.description,
+          )
         }
         return {
           status: 'running',
@@ -660,6 +717,9 @@ server.tool(
         }
       } catch (error) {
         await Promise.all(sessions.map(item => killTeamTmuxSession(item.tmuxSession)))
+        await Promise.all(plan.teams.map(team =>
+          rm(organizationStore.teamRuntimeDirectory(plan.organizationName, team.name), { recursive: true, force: true }),
+        ))
         await organizationStore.remove()
         throw error
       }
@@ -798,7 +858,12 @@ server.tool(
     const state = await organizationStore.read()
     if (!state || state.organization.name !== plan.targetName) throw new TeamError('the planned organization is no longer active')
     await Promise.all(state.teams.map(team => killTeamTmuxSession(team.tmuxSession)))
-    const archive_path = await archiveRuntimeDirectory(projectRoot, organizationStore.directory, 'organization', state.organization.name)
+    const archive_path = await archiveOrganizationRuntime({
+      projectRoot,
+      organizationDirectory: organizationStore.directory,
+      organizationName: state.organization.name,
+      teamNames: state.teams.map(team => team.name),
+    })
     await lifecycleStore.consume(plan.id)
     return { torn_down: true, organization_name: state.organization.name, archive_path }
   }),
@@ -815,7 +880,7 @@ server.tool(
 
 function normalizeStandalonePlan(input: {
   teamName: string
-  description?: string
+  description: string
   leader: { name: string, prompt: string, agentName?: string, model?: string }
   teammates: Array<{ name: string, prompt: string, agentName?: string, model?: string }>
   maxMembers?: number
@@ -833,7 +898,7 @@ function normalizeStandalonePlan(input: {
   if (max < names.size) throw new TeamError('max_members must include every planned member')
   return {
     teamName: sanitizeTeamName(input.teamName),
-    description: input.description?.trim(),
+    description: input.description.trim(),
     leader,
     teammates,
     maxMembers: max,
@@ -847,7 +912,7 @@ server.tool(
   'Save a complete standalone team composition without starting tmux or Pool workers. Show the plan to the user and call team_approve only after a later explicit approval.',
   {
     team_name: nonEmpty,
-    description: nonEmpty.optional(),
+    description: nonEmpty.describe('Concrete initial work instruction delivered to the team leader after every approved member is ready.'),
     leader: plannedMember,
     teammates: z.array(plannedMember).min(1),
     max_members: maxMembers.optional(),
@@ -899,16 +964,27 @@ server.tool(
       maxStalledChecks: plan.maxStalledChecks,
     })
     try {
-      await createTeamTmuxSession({ session: tmuxSession, projectRoot, statePath: store.statePath })
+      await createTeamTmuxSession({
+        session: tmuxSession,
+        projectRoot,
+        statePath: store.statePath,
+        runtimeDirectory: dirname(store.statePath),
+      })
       const watchdogPid = startTeamWatchdog({ statePath: store.statePath, session: tmuxSession })
       await store.updateTeam(team => { team.watchdogPid = watchdogPid })
       await spawnPoolWorker({
         name: plan.leader.name,
-        prompt: buildStandaloneLeaderPrompt(plan.description),
+        prompt: buildAgentInstructions({
+          name: plan.leader.name,
+          teamName: state.team.name,
+          role: 'leader',
+          rolePrompt: plan.leader.prompt,
+        }),
         teamName: state.team.name,
         tmuxSession,
         projectRoot,
         role: 'leader',
+        runtimeDirectory: dirname(store.statePath),
         agentName: plan.leader.agentName,
         model: plan.leader.model,
         replaceExisting: true,
@@ -917,14 +993,21 @@ server.tool(
       for (const teammate of plan.teammates) {
         await spawnPoolWorker({
           name: teammate.name,
-          prompt: teammate.prompt,
+          prompt: buildAgentInstructions({
+            name: teammate.name,
+            teamName: state.team.name,
+            role: 'teammate',
+            rolePrompt: teammate.prompt,
+          }),
           teamName: state.team.name,
           tmuxSession,
           projectRoot,
+          runtimeDirectory: dirname(store.statePath),
           agentName: teammate.agentName,
           model: teammate.model,
         }, store)
       }
+      await startApprovedTeamWork(store, plan.description)
     } catch (error) {
       await killTeamTmuxSession(tmuxSession)
       await store.remove()

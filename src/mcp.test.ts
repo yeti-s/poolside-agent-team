@@ -117,6 +117,7 @@ test('serves agent-team tools through the MCP stdio protocol', async () => {
         organization_name: 'MCP Organization',
         teams: [{
           name: 'delivery',
+          description: 'Deliver the approved MCP feature.',
           leader: { name: 'delivery_lead', prompt: 'Coordinate delivery work.' },
           teammates: [{ name: 'implementer', prompt: 'Implement the approved work.' }],
         }],

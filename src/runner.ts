@@ -1,5 +1,5 @@
 import { execFile, spawn } from 'node:child_process'
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
@@ -90,8 +90,7 @@ export async function createTeamTmuxSession(input: {
     throw new Error(`tmux session "${input.session}" already exists`)
   }
   const runDirectory = input.runtimeDirectory
-    ? join(input.runtimeDirectory, 'run')
-    : join(input.projectRoot, '.poolside', 'agent-team', 'run')
+    ?? join(input.projectRoot, '.poolside', 'agent-team')
   await mkdir(runDirectory, { recursive: true })
   const dashboardPath = join(runDirectory, 'team-status.sh')
   await writeFile(
@@ -135,23 +134,21 @@ async function spawnPoolWorkerSerial(
   input: SpawnWorkerInput,
   store: TeamStore,
 ): Promise<SpawnedWorker> {
-  const teamDirectory = input.runtimeDirectory ?? join(input.projectRoot, '.poolside', 'agent-team')
-  const runDirectory = join(teamDirectory, 'run')
-  const logsDirectory = join(teamDirectory, 'logs')
-  await Promise.all([mkdir(runDirectory, { recursive: true }), mkdir(logsDirectory, { recursive: true })])
+  const teamDirectory = input.runtimeDirectory ?? join(input.projectRoot, '.poolside', 'agent-team', input.teamName)
+  const agentDirectory = join(teamDirectory, `${input.teamName}-${input.name}`)
+  await mkdir(agentDirectory, { recursive: true })
 
-  const logPath = join(logsDirectory, `${input.name}.log`)
-  const configPath = join(runDirectory, `${input.name}.json`)
-  const sessionIdPath = join(runDirectory, `${input.name}.session.json`)
+  const logPath = join(agentDirectory, `${input.name}.log`)
+  const configPath = join(agentDirectory, `${input.name}.json`)
+  const sessionIdPath = join(agentDirectory, `${input.name}.session.json`)
+  const instructionsPath = join(agentDirectory, 'AGENTS.md')
   const workerEntrypoint = fileURLToPath(new URL('./worker.js', import.meta.url))
   const poolCommand = process.env.POOL_AGENT_TEAM_POOL_COMMAND || 'pool'
   const basePoolArgs = [
     '--directory',
-    input.projectRoot,
+    agentDirectory,
     '--mode',
     'always-allow',
-    '--prompt-queue',
-    buildWorkerPrompt({ ...input, resumeSessionId: undefined }),
   ]
   if (input.recoveryMessage) basePoolArgs.push('--prompt-queue', buildRecoveryPrompt(input.recoveryMessage))
   if (input.model) basePoolArgs.push('--model', input.model)
@@ -169,7 +166,8 @@ async function spawnPoolWorkerSerial(
     statePath: store.statePath,
     role: input.role,
   }
-  await rm(sessionIdPath, { force: true })
+  await writeFile(sessionIdPath, JSON.stringify({ complete: false }), { mode: 0o600 })
+  await writeFile(instructionsPath, input.prompt, { mode: 0o600 })
   await writeFile(configPath, `${JSON.stringify(config)}\n`, { mode: 0o600 })
 
   const teamWindowTarget = `${input.tmuxSession}:${TEAM_WINDOW}`
@@ -314,25 +312,6 @@ export function startOrganizationWatchdog(input: { statePath: string }): number 
   child.unref()
   if (!child.pid) throw new Error('organization watchdog did not provide a process ID')
   return child.pid
-}
-
-function buildWorkerPrompt(input: SpawnWorkerInput): string {
-  return [
-    `You are ${input.role === 'leader' ? 'the team leader' : 'a teammate'} "${input.name}" in Pool agent team "${input.teamName}"${input.organizationName ? ` of organization "${input.organizationName}"` : ''}.`,
-    'Use the agent-team MCP tools for all coordination.',
-    'Start by checking task_list and message_list. Work only on tasks assigned to you or explicitly ask the lead before claiming work.',
-    'When a task takes more than a few minutes, periodically call task_update with a concise progress_note containing a concrete result, evidence, or blocker. Repeating an unchanged status is not progress.',
-    'A team-lead watchdog reviews unchanged in-progress tasks every five minutes by default. After repeated unchanged reviews it will interrupt broad reasoning and require the task to be split into small, independently verifiable steps.',
-    'A later direct coordination message from team-lead is an explicit task assignment, even when task_list has no unfinished task assigned to you. Execute it and report the result with message_send; do not dismiss it because earlier work is complete.',
-    'After completing work, call task_update to mark it completed when there is a matching task, send a concise message to the requester or team-lead, then remain available for a later coordination message. Only leave the team after an explicit shutdown request.',
-    input.role === 'leader'
-      ? 'You are a coordination-only leader. Before inspecting project files or taking any other action, create and assign one concrete initial task to every approved teammate. Never write product source, run package installation or tests, scaffold an application, or generate implementation files. Manage approved members by assigning, updating, interrupting, decomposing, and finalizing work. When all tracked tasks are terminal, you must call team_finalize with a concise outcome and evidence before broadcasting the completion summary. You cannot create, remove, or shut down teammates or delete the team. Use organization_message_send only to exchange opinions with another team leader. Do not contact another team\'s teammates directly.'
-      : 'You cannot create teammates or delete the team. Do not communicate with members outside your own team.',
-    'Do not modify files outside the requested project.',
-    '',
-    'Assigned work:',
-    input.prompt,
-  ].join('\n')
 }
 
 function buildRecoveryPrompt(message: string): string {
