@@ -70,6 +70,30 @@ test('allows staged work after one executable initial teammate assignment', asyn
   })
 })
 
+test('records a validated execution plan before tracked task creation', async () => {
+  await withStore(async store => {
+    await createTeam(store)
+    await store.addMember({ name: 'developer', role: 'teammate', joinedAt: new Date().toISOString(), status: 'idle' })
+    await store.addMember({ name: 'reviewer', role: 'teammate', joinedAt: new Date().toISOString(), status: 'idle' })
+    const workPlan = await store.setWorkPlan({
+      summary: 'Implement first and review the completed result.',
+      steps: [
+        { id: 'implementation', subject: 'Implement feature', owner: 'developer' },
+        { id: 'review', subject: 'Review feature', owner: 'reviewer', dependsOn: ['implementation'] },
+      ],
+    })
+    assert.equal(workPlan.steps[1]?.dependsOn[0], 'implementation')
+    assert.equal((await store.read())?.team.workPlan?.summary, workPlan.summary)
+    await assert.rejects(
+      () => store.setWorkPlan({
+        summary: 'Invalid graph',
+        steps: [{ id: 'review', subject: 'Review', owner: 'reviewer', dependsOn: ['missing'] }],
+      }),
+      /unknown step/,
+    )
+  })
+})
+
 test('maintains task dependencies and refuses blocked work', async () => {
   await withStore(async store => {
     await createTeam(store)

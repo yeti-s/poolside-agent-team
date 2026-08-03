@@ -79,6 +79,7 @@ The organization lead can inspect the teams with `organization_status` and remov
 | `team_list`, `team_status` | Inspect members, tmux identifiers, task summary, and messages |
 | `team_adopt` | Transfer team-lead ownership to a restarted Pool CLI session |
 | `team_resume` | Explicitly restart a stopped or failed teammate, preferring its saved Pool session |
+| `team_work_plan` | Leader-only: record the complete execution graph before creating the first tracked task |
 | `task_create`, `task_list`, `task_update` | Create, view, assign, and complete shared tasks; use `depends_on` for prerequisites and `task_update.progress_note` for concrete progress or blockers |
 | `message_send`, `message_list` | Send and read teammate messages (`task`/`handoff`/`decision` prompt a response; `fyi`/`ack` do not) |
 | `team_interrupt` | Leader-only: interrupt a teammate's current task without closing its Pool session |
@@ -153,3 +154,8 @@ until an implementation prerequisite is complete; represent that sequence with
 `depends_on`, or assign the later work only when it becomes ready. The initial
 leadership watchdog requires one executable first assignment, not an immediate
 assignment for every teammate.
+
+Before the first `task_create`, the team leader must record `team_work_plan`.
+Its steps describe the intended outcomes, owners, and step-level dependencies;
+the leader then creates the concrete tasks in dependency order with the matching
+task IDs in `depends_on`.

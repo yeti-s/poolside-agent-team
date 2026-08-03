@@ -65,6 +65,7 @@ test('serves agent-team tools through the MCP stdio protocol', async () => {
     assert.ok(names.includes('team_plan'))
     assert.ok(names.includes('team_approve'))
     assert.ok(names.includes('team_finalize'))
+    assert.ok(names.includes('team_work_plan'))
     assert.ok(names.includes('team_report'))
     assert.ok(names.includes('team_wait_for_report'))
     assert.ok(names.includes('team_teardown_plan'))
@@ -227,6 +228,25 @@ test('delivers owned tasks and exposes unassigned tasks separately from live wor
       clientInfo: { name: 'agent-team-assignment-test', version: '1.0.0' },
     })
     server.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })}\n`)
+    const missingPlan = await request('tools/call', {
+      name: 'task_create',
+      arguments: { subject: 'Implement assignment', description: 'Make the delivery observable.', owner: 'worker' },
+    })
+    const missingPlanResult = missingPlan.result as { isError?: boolean, content: Array<{ text: string }> }
+    assert.equal(missingPlanResult.isError, true)
+    assert.match(missingPlanResult.content[0]?.text ?? '', /team_work_plan/)
+    const plan = await request('tools/call', {
+      name: 'team_work_plan',
+      arguments: {
+        summary: 'Implement first, then review the completed implementation.',
+        steps: [
+          { id: 'implementation', subject: 'Implement assignment', owner: 'worker' },
+          { id: 'review', subject: 'Review implementation', owner: 'worker', depends_on: ['implementation'] },
+        ],
+      },
+    })
+    const planResult = plan.result as { isError?: boolean, content: Array<{ text: string }> }
+    assert.equal(planResult.isError, undefined, planResult.content[0]?.text)
     const owned = await request('tools/call', {
       name: 'task_create',
       arguments: { subject: 'Implement assignment', description: 'Make the delivery observable.', owner: 'worker' },

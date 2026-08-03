@@ -54,6 +54,7 @@ let workerLaunchQueue: Promise<void> = Promise.resolve()
 export const TEAM_LEADER_MCP_TOOLS = [
   'team_list',
   'team_status',
+  'team_work_plan',
   'task_create',
   'task_list',
   'task_update',

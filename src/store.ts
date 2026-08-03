@@ -8,6 +8,7 @@ import type {
   TeamMessage,
   TeamState,
   TeamTask,
+  TeamWorkPlan,
 } from './types.js'
 
 const LOCK_RETRY_MS = 25
@@ -223,6 +224,50 @@ export class TeamStore {
         team.initialAssignmentDeadlineAt = new Date(Date.now() + INITIAL_ASSIGNMENT_TIMEOUT_MS).toISOString()
       }
     })
+  }
+
+  /** Record the leader's execution graph before tracked task creation begins. */
+  async setWorkPlan(input: {
+    summary: string
+    steps: Array<{ id: string, subject: string, owner: string, dependsOn?: string[] }>
+  }): Promise<TeamWorkPlan> {
+    let saved!: TeamWorkPlan
+    await this.mutate(current => {
+      const state = requireTeam(current)
+      const stepIds = new Set<string>()
+      for (const step of input.steps) {
+        const id = step.id.trim()
+        if (!id) throw new TeamError('work-plan step IDs must not be empty')
+        if (stepIds.has(id)) throw new TeamError(`duplicate work-plan step ID "${id}"`)
+        assertMember(state, step.owner)
+        stepIds.add(id)
+      }
+      for (const step of input.steps) {
+        const id = step.id.trim()
+        const dependencies = step.dependsOn ?? []
+        if (dependencies.includes(id)) throw new TeamError(`work-plan step "${id}" cannot depend on itself`)
+        for (const dependency of dependencies) {
+          if (!stepIds.has(dependency)) {
+            throw new TeamError(`work-plan step "${id}" depends on unknown step "${dependency}"`)
+          }
+        }
+      }
+      const now = new Date().toISOString()
+      saved = {
+        summary: input.summary.trim(),
+        steps: input.steps.map(step => ({
+          id: step.id.trim(),
+          subject: step.subject.trim(),
+          owner: step.owner,
+          dependsOn: [...new Set(step.dependsOn ?? [])],
+        })),
+        createdAt: state.team.workPlan?.createdAt ?? now,
+        updatedAt: now,
+      }
+      state.team.workPlan = saved
+      return state
+    })
+    return saved
   }
 
   private async readPlans(): Promise<TeamCreationPlan[]> {

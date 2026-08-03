@@ -10,6 +10,7 @@ test('renders the leader template with MCP-only coordination and the role prompt
     rolePrompt: 'Coordinate implementation delivery.',
   })
   assert.match(instructions, /task_create\(\{ subject, description, owner, depends_on\? \}\)/)
+  assert.match(instructions, /team_work_plan\(\{ summary, steps \}\)/)
   assert.match(instructions, /team_finalize/)
   assert.match(instructions, /Assign independent, immediately executable tasks in parallel when that helps/)
   assert.match(instructions, /leave a reviewer, tester, or other teammate idle/)

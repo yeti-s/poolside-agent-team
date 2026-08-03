@@ -68,6 +68,19 @@ export interface TeamFinalReport {
   blockers?: string
 }
 
+/** A leader-authored execution plan that precedes creation of tracked tasks. */
+export interface TeamWorkPlan {
+  summary: string
+  steps: Array<{
+    id: string
+    subject: string
+    owner: string
+    dependsOn: string[]
+  }>
+  createdAt: string
+  updatedAt: string
+}
+
 export interface TeamMessage {
   id: string
   from: string
@@ -105,6 +118,8 @@ export interface TeamState {
     maxStalledChecks?: number
     /** Written by team-lead when the team has a final outcome for the main CLI. */
     finalReport?: TeamFinalReport
+    /** Leader-authored execution plan recorded before the first tracked task. */
+    workPlan?: TeamWorkPlan
     /** Last automatic reminder to submit a missing final report. */
     finalizationReminderAt?: string
     /** An executable initial teammate task must be assigned before this deadline. */

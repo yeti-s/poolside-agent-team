@@ -161,7 +161,7 @@ function initialLeaderWorkPrompt(description: string): string {
     'The main Pool CLI has completed creation of every approved team member.',
     'Team objective:',
     description,
-    'Act as team leader only. Create and assign the first executable work to the teammate(s) needed now. Run independent work in parallel when useful. For work that must wait (for example review or testing after implementation), create it with depends_on or assign it later after its prerequisite completes. Do not assign every approved teammate merely to keep them busy; an idle teammate is expected until suitable work is ready. Do not implement product work yourself.',
+    'Act as team leader only. First call team_work_plan to record the complete execution graph: outcomes, owners, and step dependencies. Only then create tracked tasks in dependency order, assigning the first executable work to the teammate(s) needed now. Run independent work in parallel when useful. For work that must wait (for example review or testing after implementation), create it with depends_on or assign it later after its prerequisite completes. Do not assign every approved teammate merely to keep them busy; an idle teammate is expected until suitable work is ready. Do not implement product work yourself.',
   ].join('\n\n')
 }
 
@@ -365,10 +365,14 @@ async function runLeaderProgressMonitor(): Promise<void> {
   }
 }
 
-function initialAssignmentPrompt(): string {
+function initialAssignmentPrompt(hasWorkPlan: boolean): string {
   return [
-    'Automated leadership escalation: no executable initial work has been assigned to a teammate.',
-    'Immediately create and assign the smallest concrete task that can start now. Use depends_on for later review, testing, or integration work; do not assign teammates simply to make every member busy.',
+    hasWorkPlan
+      ? 'Automated leadership escalation: no executable initial work has been assigned to a teammate.'
+      : 'Automated leadership escalation: no execution plan has been recorded.',
+    hasWorkPlan
+      ? 'Immediately create and assign the smallest concrete task that can start now. Use depends_on for later review, testing, or integration work; do not assign teammates simply to make every member busy.'
+      : 'First call team_work_plan with the complete work graph, including owners and step dependencies. Then create and assign the smallest concrete task that can start now.',
     'Do not inspect or modify project files, install dependencies, scaffold an application, or perform implementation work yourself. Use task_create, task_update, and message_send only to establish the work plan.',
   ].join('\n')
 }
@@ -397,7 +401,7 @@ async function runInitialAssignmentMonitor(): Promise<void> {
     if (!Number.isFinite(deadline) || Date.now() < deadline) return
     const lastEscalation = Date.parse(state.team.initialAssignmentEscalatedAt ?? '')
     if (Number.isFinite(lastEscalation) && Date.now() - lastEscalation < 30_000) return
-    const prompt = initialAssignmentPrompt()
+    const prompt = initialAssignmentPrompt(Boolean(state.team.workPlan))
     await store.updateTeam(team => { team.initialAssignmentEscalatedAt = new Date().toISOString() })
     await store.addMessage({ from: 'system', to: state.team.lead, body: prompt, kind: 'system', requiresResponse: true })
     const leader = state.members.find(member => member.name === state.team.lead)
@@ -1150,8 +1154,38 @@ server.tool(
 )
 
 server.tool(
+  'team_work_plan',
+  'Record the team-lead execution plan before creating the first tracked task. Include every intended work stream, its owner, and step-level prerequisites. The plan is visible in team_status and may be revised before later task creation.',
+  {
+    summary: nonEmpty.describe('Concise execution strategy and success criteria.'),
+    steps: z.array(z.object({
+      id: nonEmpty.describe('Stable step identifier used only within this work plan.'),
+      subject: nonEmpty.describe('Concrete outcome for this step.'),
+      owner: nonEmpty.describe('Approved teammate responsible for this step.'),
+      depends_on: z.array(nonEmpty).optional().describe('Work-plan step IDs that must complete first.'),
+    })).min(1),
+  },
+  async ({ summary, steps }) => execute(async () => {
+    await requireLead()
+    const workPlan = await store.setWorkPlan({
+      summary,
+      steps: steps.map(step => ({
+        id: step.id,
+        subject: step.subject,
+        owner: step.owner,
+        dependsOn: step.depends_on,
+      })),
+    })
+    return {
+      work_plan: workPlan,
+      next: 'Create tracked tasks in dependency order. Give task_create depends_on only the already-created prerequisite task IDs.',
+    }
+  }),
+)
+
+server.tool(
   'task_create',
-  'Create a task in the shared team task list. Use depends_on for prerequisite task IDs; blocks is the legacy inverse relation for task IDs that this task prevents from starting. Supplying a teammate owner immediately delivers an actionable assignment prompt to that teammate; an unowned task is only recorded and will appear as unassigned in team_status.',
+  'Create a task in the shared team task list after team_work_plan has recorded the execution graph. Create tasks in dependency order and use depends_on for prerequisite task IDs; blocks is the legacy inverse relation for task IDs that this task prevents from starting. Supplying a teammate owner immediately delivers an actionable assignment prompt to that teammate; an unowned task is only recorded and will appear as unassigned in team_status.',
   {
     subject: nonEmpty,
     description: nonEmpty,
@@ -1162,6 +1196,10 @@ server.tool(
   async ({ subject, description, owner, blocks, depends_on }) =>
     execute(async () => {
       await requireLead()
+      const state = await currentState()
+      if (state.tasks.length === 0 && !state.team.workPlan) {
+        throw new TeamError('call team_work_plan before creating the first tracked task')
+      }
       const from = callerName()
       const task = await store.addTask({ subject, description, owner, blocks, dependsOn: depends_on })
       const assignment_delivery = await deliverTaskAssignment(task, from)
