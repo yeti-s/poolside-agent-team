@@ -1,5 +1,6 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
+import { dirname } from 'node:path'
 import { z } from 'zod'
 import {
   DEFAULT_MAX_MEMBERS,
@@ -34,11 +35,13 @@ import {
   type TaskStatus,
 } from './types.js'
 import { OrganizationStore, normalizePlan } from './organization.js'
+import { LifecycleStore, archiveRuntimeDirectory, type TeardownKind } from './lifecycle.js'
 
 const projectRoot = process.env.POOL_AGENT_TEAM_PROJECT_ROOT || process.cwd()
 const organizationName = process.env.POOL_AGENT_ORGANIZATION
 const organizationTeamName = process.env.POOL_AGENT_TEAM_NAME
 const organizationStore = new OrganizationStore(projectRoot)
+const lifecycleStore = new LifecycleStore(projectRoot)
 if (organizationName && !organizationTeamName) {
   throw new Error('organization workers require POOL_AGENT_TEAM_NAME')
 }
@@ -57,6 +60,8 @@ const maxStalledChecks = z.number().int().min(1).max(10)
 let heartbeatTimer: NodeJS.Timeout | undefined
 let progressMonitorTimer: NodeJS.Timeout | undefined
 let progressMonitorInProgress = false
+let initialAssignmentMonitorTimer: NodeJS.Timeout | undefined
+let initialAssignmentMonitorInProgress = false
 
 function callerName(): string {
   return process.env.POOL_AGENT_TEAM_MEMBER || 'team-lead'
@@ -84,6 +89,10 @@ function requiredOrganizationApproval(planId: string): string {
 
 function requiredTeamApproval(planId: string): string {
   return `APPROVE TEAM ${planId}`
+}
+
+function requiredTeardownApproval(kind: TeardownKind, planId: string): string {
+  return `APPROVE ${kind === 'organization' ? 'ORGANIZATION' : 'TEAM'} TEARDOWN ${planId}`
 }
 
 function assertConversationalApproval(planId: string, userApproval: string): void {
@@ -315,6 +324,52 @@ async function runLeaderProgressMonitor(): Promise<void> {
   }
 }
 
+function initialAssignmentPrompt(teammates: string[]): string {
+  return [
+    'Automated leadership escalation: initial work has not been assigned to every approved teammate.',
+    `Immediately create and assign a concrete task to each of: ${teammates.join(', ')}.`,
+    'Do not inspect or modify project files, install dependencies, scaffold an application, or perform implementation work yourself. Use task_create and message_send only to establish the work plan.',
+  ].join('\n')
+}
+
+async function runInitialAssignmentMonitor(): Promise<void> {
+  if (initialAssignmentMonitorInProgress) return
+  initialAssignmentMonitorInProgress = true
+  try {
+    const state = await store.read()
+    if (!state || state.team.lead !== callerName() || !state.team.initialAssignmentDeadlineAt) return
+    const teammates = state.members.filter(member => member.role === 'teammate')
+    if (teammates.length === 0) return
+    const unassigned = teammates.filter(member => !state.tasks.some(task =>
+      task.owner === member.name && task.status !== 'completed' && task.status !== 'decomposed',
+    ))
+    if (unassigned.length === 0) {
+      await store.updateTeam(team => {
+        team.initialAssignmentDeadlineAt = undefined
+        team.initialAssignmentEscalatedAt = undefined
+      })
+      return
+    }
+    const deadline = Date.parse(state.team.initialAssignmentDeadlineAt)
+    if (!Number.isFinite(deadline) || Date.now() < deadline) return
+    const lastEscalation = Date.parse(state.team.initialAssignmentEscalatedAt ?? '')
+    if (Number.isFinite(lastEscalation) && Date.now() - lastEscalation < 30_000) return
+    const prompt = initialAssignmentPrompt(unassigned.map(member => member.name))
+    await store.updateTeam(team => { team.initialAssignmentEscalatedAt = new Date().toISOString() })
+    await store.addMessage({ from: 'system', to: state.team.lead, body: prompt, kind: 'system', requiresResponse: true })
+    const leader = state.members.find(member => member.name === state.team.lead)
+    if (leader?.tmuxPaneId) {
+      await interruptTmuxPane(leader.tmuxPaneId).catch(() => undefined)
+      await sendPromptToTmuxPane(leader.tmuxPaneId, prompt).catch(() => undefined)
+    }
+  } catch {
+    // The next interval retries a transient state or tmux error without
+    // affecting team lifecycle.
+  } finally {
+    initialAssignmentMonitorInProgress = false
+  }
+}
+
 async function startLeaderProgressMonitor(): Promise<void> {
   if (isMainPoolCli() || progressMonitorTimer) return
   const state = await store.read()
@@ -322,11 +377,16 @@ async function startLeaderProgressMonitor(): Promise<void> {
   const intervalMinutes = state.team.progressCheckIntervalMinutes ?? DEFAULT_PROGRESS_CHECK_INTERVAL_MINUTES
   progressMonitorTimer = setInterval(() => { void runLeaderProgressMonitor() }, intervalMinutes * 60_000)
   progressMonitorTimer.unref()
+  initialAssignmentMonitorTimer = setInterval(() => { void runInitialAssignmentMonitor() }, 10_000)
+  initialAssignmentMonitorTimer.unref()
+  void runInitialAssignmentMonitor()
 }
 
 function stopLeaderProgressMonitor(): void {
   if (progressMonitorTimer) clearInterval(progressMonitorTimer)
   progressMonitorTimer = undefined
+  if (initialAssignmentMonitorTimer) clearInterval(initialAssignmentMonitorTimer)
+  initialAssignmentMonitorTimer = undefined
 }
 
 async function resumeMember(name: string, message?: string) {
@@ -636,17 +696,62 @@ server.tool(
 )
 
 server.tool(
-  'organization_delete',
-  'Terminate every team tmux session and remove organization state. Only organization-lead can call this.',
+  'organization_teardown_plan',
+  'Prepare, but do not execute, main CLI cancellation and teardown of the active organization. Show the returned impact and exact approval statement to the user, then wait for a later explicit approval.',
   {},
   async () => execute(async () => {
     requireMainPoolCli()
-    if (isOrganizationWorker()) throw new TeamError('only the main Pool CLI can delete an organization')
+    if (isOrganizationWorker()) throw new TeamError('only the main Pool CLI can tear down an organization')
     const state = await organizationStore.read()
     if (!state) throw new TeamError('no organization exists in this project')
+    const teamStates = await Promise.all(state.teams.map(team => organizationStore.teamStore(state.organization.name, team.name).read()))
+    const plan = await lifecycleStore.create({
+      kind: 'organization',
+      targetName: state.organization.name,
+      impact: {
+        tmuxSessions: state.teams.map(team => team.tmuxSession),
+        memberCount: teamStates.reduce((total, team) => total + (team?.members.length ?? 0), 0),
+        activeTaskCount: teamStates.reduce((total, team) => total + (team?.tasks.filter(task => task.status === 'pending' || task.status === 'in_progress').length ?? 0), 0),
+      },
+    })
+    return {
+      status: 'awaiting_user_approval',
+      teardown_id: plan.id,
+      organization_name: plan.targetName,
+      impact: plan.impact,
+      approval_rules: ['This plan does not stop work.', 'Only call organization_teardown_approve after a later user message contains the exact statement below.'],
+      required_user_approval: requiredTeardownApproval('organization', plan.id),
+    }
+  }),
+)
+
+server.tool(
+  'organization_teardown_approve',
+  'Stop every active organization worker, archive its state, and remove it from active lifecycle only after a later explicit user approval.',
+  { teardown_id: nonEmpty, user_approval: nonEmpty },
+  async ({ teardown_id, user_approval }) => execute(async () => {
+    requireMainPoolCli()
+    if (isOrganizationWorker()) throw new TeamError('only the main Pool CLI can tear down an organization')
+    const plan = await lifecycleStore.get(teardown_id)
+    if (plan.kind !== 'organization') throw new TeamError(`teardown plan "${teardown_id}" is not for an organization`)
+    if (user_approval.trim() !== requiredTeardownApproval('organization', plan.id)) {
+      throw new TeamError(`user_approval must exactly match: ${requiredTeardownApproval('organization', plan.id)}`)
+    }
+    const state = await organizationStore.read()
+    if (!state || state.organization.name !== plan.targetName) throw new TeamError('the planned organization is no longer active')
     await Promise.all(state.teams.map(team => killTeamTmuxSession(team.tmuxSession)))
-    await organizationStore.remove()
-    return { deleted: true, organization_name: state.organization.name }
+    const archive_path = await archiveRuntimeDirectory(projectRoot, organizationStore.directory, 'organization', state.organization.name)
+    await lifecycleStore.consume(plan.id)
+    return { torn_down: true, organization_name: state.organization.name, archive_path }
+  }),
+)
+
+server.tool(
+  'organization_delete',
+  'Disabled immediate-delete alias. Use organization_teardown_plan, show its impact to the user, then call organization_teardown_approve only after a later explicit approval.',
+  {},
+  async () => execute(async () => {
+    throw new TeamError('organization_delete is disabled; use organization_teardown_plan followed by organization_teardown_approve')
   }),
 )
 
@@ -1123,18 +1228,62 @@ server.tool(
 )
 
 server.tool(
-  'team_delete',
-  'Terminate all team panes and delete the team state. Only the main Pool CLI may call this explicit lifecycle action.',
+  'team_teardown_plan',
+  'Prepare, but do not execute, main CLI cancellation and teardown of the active standalone team. Show the returned impact and exact approval statement to the user, then wait for a later explicit approval.',
   {},
   async () =>
     execute(async () => {
       requireMainPoolCli()
-      if (isOrganizationWorker()) throw new TeamError('use organization_delete to remove an organization')
+      if (isOrganizationWorker()) throw new TeamError('use organization_teardown_plan to remove an organization')
       const state = await currentState()
-      await killTeamTmuxSession(state.team.tmuxSession)
-      await store.remove()
-      return { deleted: true, team_name: state.team.name }
+      const plan = await lifecycleStore.create({
+        kind: 'team',
+        targetName: state.team.name,
+        impact: {
+          tmuxSessions: [state.team.tmuxSession],
+          memberCount: state.members.length,
+          activeTaskCount: state.tasks.filter(task => task.status === 'pending' || task.status === 'in_progress').length,
+        },
+      })
+      return {
+        status: 'awaiting_user_approval',
+        teardown_id: plan.id,
+        team_name: plan.targetName,
+        impact: plan.impact,
+        approval_rules: ['This plan does not stop work.', 'Only call team_teardown_approve after a later user message contains the exact statement below.'],
+        required_user_approval: requiredTeardownApproval('team', plan.id),
+      }
     }),
+)
+
+server.tool(
+  'team_teardown_approve',
+  'Stop every standalone team worker, archive its state, and remove it from active lifecycle only after a later explicit user approval.',
+  { teardown_id: nonEmpty, user_approval: nonEmpty },
+  async ({ teardown_id, user_approval }) => execute(async () => {
+    requireMainPoolCli()
+    if (isOrganizationWorker()) throw new TeamError('use organization_teardown_approve to remove an organization')
+    const plan = await lifecycleStore.get(teardown_id)
+    if (plan.kind !== 'team') throw new TeamError(`teardown plan "${teardown_id}" is not for a standalone team`)
+    if (user_approval.trim() !== requiredTeardownApproval('team', plan.id)) {
+      throw new TeamError(`user_approval must exactly match: ${requiredTeardownApproval('team', plan.id)}`)
+    }
+    const state = await currentState()
+    if (state.team.name !== plan.targetName) throw new TeamError('the planned team is no longer active')
+    await killTeamTmuxSession(state.team.tmuxSession)
+    const archive_path = await archiveRuntimeDirectory(projectRoot, dirname(store.statePath), 'team', state.team.name)
+    await lifecycleStore.consume(plan.id)
+    return { torn_down: true, team_name: state.team.name, archive_path }
+  }),
+)
+
+server.tool(
+  'team_delete',
+  'Disabled immediate-delete alias. Use team_teardown_plan, show its impact to the user, then call team_teardown_approve only after a later explicit approval.',
+  {},
+  async () => execute(async () => {
+    throw new TeamError('team_delete is disabled; use team_teardown_plan followed by team_teardown_approve')
+  }),
 )
 
 await server.connect(new StdioServerTransport())

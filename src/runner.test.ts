@@ -21,10 +21,12 @@ async function waitFor(
 test('starts interactive Pool workers in tiled panes of the team window', async () => {
   const projectRoot = await mkdtemp(join(tmpdir(), 'pool-agent-team-runner-'))
   const fakeTmux = join(projectRoot, 'fake-tmux.mjs')
+  const fakeBwrap = join(projectRoot, 'fake-bwrap.sh')
   const receivedArgs = join(projectRoot, 'tmux-args.json')
   const previousCommand = process.env.POOL_AGENT_TEAM_TMUX_COMMAND
   const previousOutput = process.env.POOL_AGENT_TEAM_TEST_OUTPUT
   const previousDiscoveryTimeout = process.env.POOL_AGENT_TEAM_SESSION_DISCOVERY_TIMEOUT_MS
+  const previousBwrap = process.env.POOL_AGENT_TEAM_BWRAP_COMMAND
   try {
     await writeFile(
       fakeTmux,
@@ -37,9 +39,12 @@ test('starts interactive Pool workers in tiled panes of the team window', async 
       ].join('\n'),
     )
     await chmod(fakeTmux, 0o755)
+    await writeFile(fakeBwrap, '#!/bin/sh\nexit 0\n')
+    await chmod(fakeBwrap, 0o755)
     process.env.POOL_AGENT_TEAM_TMUX_COMMAND = fakeTmux
     process.env.POOL_AGENT_TEAM_TEST_OUTPUT = receivedArgs
     process.env.POOL_AGENT_TEAM_SESSION_DISCOVERY_TIMEOUT_MS = '0'
+    process.env.POOL_AGENT_TEAM_BWRAP_COMMAND = fakeBwrap
 
     const store = new TeamStore(projectRoot)
     await store.create({
@@ -112,6 +117,28 @@ test('starts interactive Pool workers in tiled panes of the team window', async 
     assert.match(config.poolArgs[5]!, /task_update with a concise progress_note/)
     assert.match(config.poolArgs[5]!, /watchdog reviews unchanged in-progress tasks every five minutes/)
     assert.match(config.poolArgs[5]!, /Only leave the team after an explicit shutdown request/)
+
+    const leader = await spawnPoolWorker(
+      {
+        name: 'team-lead',
+        teamName: 'feature-x',
+        tmuxSession: 'pool-team-feature-x',
+        prompt: 'Coordinate the approved work.',
+        projectRoot,
+        role: 'leader',
+        replaceExisting: true,
+      },
+      store,
+    )
+    assert.ok(leader.tmuxPaneId)
+    const leaderConfig = JSON.parse(await readFile(join(projectRoot, '.poolside', 'agent-team', 'run', 'team-lead.json'), 'utf8')) as {
+      leaderSandbox?: { command: string, args: string[] }
+      poolArgs: string[]
+    }
+    assert.equal(leaderConfig.leaderSandbox?.command, fakeBwrap)
+    assert.ok(leaderConfig.leaderSandbox?.args.includes('--ro-bind'))
+    assert.ok(leaderConfig.leaderSandbox?.args.includes(join(projectRoot, '.poolside', 'agent-team')))
+    assert.match(leaderConfig.poolArgs[5]!, /coordination-only leader/)
   } finally {
     if (previousCommand === undefined) delete process.env.POOL_AGENT_TEAM_TMUX_COMMAND
     else process.env.POOL_AGENT_TEAM_TMUX_COMMAND = previousCommand
@@ -119,6 +146,8 @@ test('starts interactive Pool workers in tiled panes of the team window', async 
     else process.env.POOL_AGENT_TEAM_TEST_OUTPUT = previousOutput
     if (previousDiscoveryTimeout === undefined) delete process.env.POOL_AGENT_TEAM_SESSION_DISCOVERY_TIMEOUT_MS
     else process.env.POOL_AGENT_TEAM_SESSION_DISCOVERY_TIMEOUT_MS = previousDiscoveryTimeout
+    if (previousBwrap === undefined) delete process.env.POOL_AGENT_TEAM_BWRAP_COMMAND
+    else process.env.POOL_AGENT_TEAM_BWRAP_COMMAND = previousBwrap
     await rm(projectRoot, { recursive: true, force: true })
   }
 })

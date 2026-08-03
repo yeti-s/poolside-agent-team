@@ -15,6 +15,7 @@ export const DEFAULT_MAX_MEMBERS = 4
 export const LEADER_HEARTBEAT_TIMEOUT_MS = 8_000
 export const DEFAULT_PROGRESS_CHECK_INTERVAL_MINUTES = 5
 export const DEFAULT_MAX_STALLED_CHECKS = 2
+export const INITIAL_ASSIGNMENT_TIMEOUT_MS = 60_000
 
 export interface TaskProgressCheck {
   task: TeamTask
@@ -128,6 +129,7 @@ export class TeamStore {
           heartbeatAt: now,
           progressCheckIntervalMinutes: input.progressCheckIntervalMinutes ?? DEFAULT_PROGRESS_CHECK_INTERVAL_MINUTES,
           maxStalledChecks: input.maxStalledChecks ?? DEFAULT_MAX_STALLED_CHECKS,
+          initialAssignmentDeadlineAt: new Date(Date.now() + INITIAL_ASSIGNMENT_TIMEOUT_MS).toISOString(),
         },
         nextTaskNumber: 1,
         nextMessageNumber: 1,
@@ -253,6 +255,16 @@ export class TeamStore {
         lastProgressNote: 'Task created',
       }
       state.tasks.push(created)
+      if (input.owner && input.owner !== state.team.lead) {
+        const teammates = state.members.filter(member => member.role === 'teammate')
+        const everyTeammateAssigned = teammates.length > 0 && teammates.every(member =>
+          state.tasks.some(task => task.owner === member.name && task.status !== 'completed' && task.status !== 'decomposed'),
+        )
+        if (everyTeammateAssigned) {
+          state.team.initialAssignmentDeadlineAt = undefined
+          state.team.initialAssignmentEscalatedAt = undefined
+        }
+      }
       for (const blockedTaskId of blocks) {
         const blocked = getTask(state, blockedTaskId)
         if (!blocked.blockedBy.includes(created.id)) blocked.blockedBy.push(created.id)
@@ -362,6 +374,16 @@ export class TeamStore {
         }
       }
       if (input.owner !== undefined) task.owner = input.owner ?? undefined
+      if (task.owner && task.owner !== state.team.lead) {
+        const teammates = state.members.filter(member => member.role === 'teammate')
+        const everyTeammateAssigned = teammates.length > 0 && teammates.every(member =>
+          state.tasks.some(candidate => candidate.owner === member.name && candidate.status !== 'completed' && candidate.status !== 'decomposed'),
+        )
+        if (everyTeammateAssigned) {
+          state.team.initialAssignmentDeadlineAt = undefined
+          state.team.initialAssignmentEscalatedAt = undefined
+        }
+      }
       const now = new Date().toISOString()
       task.updatedAt = now
       const progressNote = input.progressNote?.trim()

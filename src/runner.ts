@@ -1,5 +1,6 @@
 import { execFile, spawn } from 'node:child_process'
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { homedir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
@@ -37,6 +38,11 @@ export interface SpawnedWorker {
   sessionId?: string
 }
 
+interface LeaderSandbox {
+  command: string
+  args: string[]
+}
+
 type WorkerConfig = SpawnWorkerInput & {
   poolCommand: string
   poolArgs: string[]
@@ -45,6 +51,8 @@ type WorkerConfig = SpawnWorkerInput & {
   sessionIdPath: string
   fallbackPoolArgs?: string[]
   statePath: string
+  role?: TeamMember['role']
+  leaderSandbox?: LeaderSandbox
 }
 
 let workerLaunchQueue: Promise<void> = Promise.resolve()
@@ -144,6 +152,9 @@ async function spawnPoolWorkerSerial(
   const sessionIdPath = join(runDirectory, `${input.name}.session.json`)
   const workerEntrypoint = fileURLToPath(new URL('./worker.js', import.meta.url))
   const poolCommand = process.env.POOL_AGENT_TEAM_POOL_COMMAND || 'pool'
+  const leaderSandbox = input.role === 'leader'
+    ? await prepareLeaderSandbox(input, input.projectRoot)
+    : undefined
   const basePoolArgs = [
     '--directory',
     input.projectRoot,
@@ -166,6 +177,8 @@ async function spawnPoolWorkerSerial(
     sessionIdPath,
     fallbackPoolArgs: input.resumeSessionId ? basePoolArgs : undefined,
     statePath: store.statePath,
+    role: input.role,
+    leaderSandbox,
   }
   await rm(sessionIdPath, { force: true })
   await writeFile(configPath, `${JSON.stringify(config)}\n`, { mode: 0o600 })
@@ -235,6 +248,44 @@ async function spawnPoolWorkerSerial(
     })
   }
   return { ...spawned, sessionId }
+}
+
+/**
+ * Leaders may coordinate only. Bubblewrap exposes the project read-only and
+ * overlays the team runtime for MCP state and coordination notes.
+ */
+async function prepareLeaderSandbox(input: SpawnWorkerInput, projectRoot: string): Promise<LeaderSandbox> {
+  const command = process.env.POOL_AGENT_TEAM_BWRAP_COMMAND || 'bwrap'
+  const runtimeDirectory = input.runtimeDirectory ?? join(projectRoot, '.poolside', 'agent-team')
+  const coordinationDirectory = join(runtimeDirectory, 'coordination')
+  const poolStateDirectory = join(runtimeDirectory, 'pool-state')
+  const poolCacheDirectory = join(runtimeDirectory, 'pool-cache')
+  await Promise.all([
+    mkdir(coordinationDirectory, { recursive: true }),
+    mkdir(poolStateDirectory, { recursive: true }),
+    mkdir(poolCacheDirectory, { recursive: true }),
+  ])
+  try {
+    // Check the actual namespace setup now. `bwrap --version` alone succeeds
+    // even on hosts that disallow unprivileged user namespaces.
+    await execFileAsync(command, ['--ro-bind', '/', '/', '--tmpfs', '/tmp', '--', 'true'], { encoding: 'utf8' })
+  } catch {
+    throw new Error('team-lead requires a working Bubblewrap (bwrap) user namespace for read-only project isolation')
+  }
+  return {
+    command,
+    args: [
+      '--die-with-parent',
+      '--new-session',
+      '--ro-bind', '/', '/',
+      '--bind', runtimeDirectory, runtimeDirectory,
+      '--tmpfs', '/tmp',
+      '--setenv', 'XDG_STATE_HOME', poolStateDirectory,
+      '--setenv', 'XDG_CACHE_HOME', poolCacheDirectory,
+      '--setenv', 'HOME', homedir(),
+      '--chdir', projectRoot,
+    ],
+  }
 }
 
 export async function killTeamTmuxSession(session: string): Promise<void> {
@@ -324,7 +375,7 @@ function buildWorkerPrompt(input: SpawnWorkerInput): string {
     'A later direct coordination message from team-lead is an explicit task assignment, even when task_list has no unfinished task assigned to you. Execute it and report the result with message_send; do not dismiss it because earlier work is complete.',
     'After completing work, call task_update to mark it completed when there is a matching task, send a concise message to the requester or team-lead, then remain available for a later coordination message. Only leave the team after an explicit shutdown request.',
     input.role === 'leader'
-      ? 'You manage only the approved members already present: assign, update, interrupt, decompose, and finalize work. You cannot create, remove, or shut down teammates or delete the team. Use organization_message_send only to exchange opinions with another team leader. Do not contact another team\'s teammates directly.'
+      ? 'You are a coordination-only leader. Before inspecting project files or taking any other action, create and assign one concrete initial task to every approved teammate. Never write product source, run package installation or tests, scaffold an application, or generate implementation files. The project is read-only; only runtime coordination notes under .poolside may be written. Manage approved members by assigning, updating, interrupting, decomposing, and finalizing work. You cannot create, remove, or shut down teammates or delete the team. Use organization_message_send only to exchange opinions with another team leader. Do not contact another team\'s teammates directly.'
       : 'You cannot create teammates or delete the team. Do not communicate with members outside your own team.',
     'Do not modify files outside the requested project.',
     '',

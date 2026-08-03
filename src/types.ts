@@ -105,6 +105,10 @@ export interface TeamState {
     maxStalledChecks?: number
     /** Written by team-lead when the team has a final outcome for the main CLI. */
     finalReport?: TeamFinalReport
+    /** Initial task distribution must be completed before this deadline. */
+    initialAssignmentDeadlineAt?: string
+    /** Last time the leader was interrupted for failing to distribute initial work. */
+    initialAssignmentEscalatedAt?: string
   }
   nextTaskNumber: number
   nextMessageNumber: number
