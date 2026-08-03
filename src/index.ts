@@ -10,6 +10,7 @@ import {
   type TeamCreationPlan,
   TeamStore,
   assertMember,
+  hasUnresolvedTasks,
   requireTeam,
   sanitizeTeamName,
   validateMemberName,
@@ -62,6 +63,10 @@ let progressMonitorTimer: NodeJS.Timeout | undefined
 let progressMonitorInProgress = false
 let initialAssignmentMonitorTimer: NodeJS.Timeout | undefined
 let initialAssignmentMonitorInProgress = false
+const configuredReportWaitInterval = Number(process.env.POOL_AGENT_TEAM_REPORT_WAIT_INTERVAL_MS)
+const REPORT_WAIT_INTERVAL_MS = Number.isFinite(configuredReportWaitInterval) && configuredReportWaitInterval >= 1_000
+  ? configuredReportWaitInterval
+  : 10 * 60_000
 
 function callerName(): string {
   return process.env.POOL_AGENT_TEAM_MEMBER || 'team-lead'
@@ -156,8 +161,28 @@ function buildStandaloneLeaderPrompt(description?: string): string {
     'Whenever a teammate reports completion, blocker, handoff, or review result, immediately read message_list and task_list.',
     'Turn each result into an explicit next task, validation task, review task, or a concise final outcome. Assign every task to a named teammate and use depends_on for prerequisites.',
     'Do not leave teammates waiting after a completion report. Before declaring the team finished, confirm that every task is completed and that all completion/report messages have been handled.',
+    'When all tracked tasks are terminal, call team_finalize with the final outcome and evidence before sending a team-wide completion summary. A completion broadcast is only a fallback; team_finalize is the required report.',
     'Do not create teammates unless the creating lead explicitly requests it; coordinate the members already present.',
   ].filter(Boolean).join('\n\n')
+}
+
+function finalizationReminderPrompt(): string {
+  return [
+    'All tracked tasks are terminal, but no final report has been recorded for the main Pool CLI.',
+    'Immediately call team_finalize with status "completed", a concise final summary, and concrete evidence. Then send any team-wide completion broadcast.',
+  ].join('\n')
+}
+
+async function remindLeaderToFinalize(state: Awaited<ReturnType<typeof currentState>>): Promise<void> {
+  if (state.team.finalReport || state.tasks.length === 0 || hasUnresolvedTasks(state)) return
+  const previous = Date.parse(state.team.finalizationReminderAt ?? '')
+  if (Number.isFinite(previous) && Date.now() - previous < 60_000) return
+  const leader = state.members.find(member => member.name === state.team.lead)
+  if (!leader?.tmuxPaneId) return
+  const prompt = finalizationReminderPrompt()
+  await store.updateTeam(team => { team.finalizationReminderAt = new Date().toISOString() })
+  await store.addMessage({ from: 'system', to: state.team.lead, kind: 'system', body: prompt, requiresResponse: true })
+  await sendPromptToTmuxPane(leader.tmuxPaneId, prompt).catch(() => undefined)
 }
 
 async function notifyLeaderOfTaskCompletion(task: { id: string, subject: string }, from: string) {
@@ -316,6 +341,7 @@ async function runLeaderProgressMonitor(): Promise<void> {
       const recipientMember = members.get(recipient)
       if (recipientMember?.tmuxPaneId) await sendPromptToTmuxPane(recipientMember.tmuxPaneId, prompt)
     }
+    await remindLeaderToFinalize(state)
   } catch {
     // Monitoring is best effort. Subsequent intervals retry transient tmux or
     // state-lock failures without disrupting the leader session.
@@ -911,7 +937,7 @@ server.tool(
       lead_agent: plan.leader.name,
       main_handoff: {
         status: 'awaiting_leader_report',
-        instruction: 'Team coordination is now exclusively owned by team-lead. Do not call team_status, team_list, team_adopt, task, or message tools. Wait until team-lead finalizes, then call team_report to relay the result to the user.',
+        instruction: 'Team coordination is now exclusively owned by team-lead. Do not call team_status, team_list, team_adopt, task, or message tools. Call team_wait_for_report once and remain waiting until it returns the leader report for user handoff.',
       },
     }
   }),
@@ -1003,6 +1029,23 @@ server.tool(
       }
     }
     return { status: 'reported', team_name: state.team.name, lead_agent: state.team.lead, final_report: state.team.finalReport }
+  }),
+)
+
+server.tool(
+  'team_wait_for_report',
+  'Main CLI-only long wait for the team-lead final report. Checks the team state every ten minutes without sending work or messages; returns only when the leader report is available or the active team disappears.',
+  {},
+  async () => execute(async () => {
+    requireMainPoolCli()
+    while (true) {
+      const state = await store.read()
+      if (!state) throw new TeamError('the active team disappeared while waiting for the leader report')
+      if (state.team.finalReport) {
+        return { status: 'reported', team_name: state.team.name, lead_agent: state.team.lead, final_report: state.team.finalReport }
+      }
+      await new Promise(resolve => setTimeout(resolve, REPORT_WAIT_INTERVAL_MS))
+    }
   }),
 )
 
@@ -1157,7 +1200,7 @@ server.tool(
 
 server.tool(
   'message_send',
-  'Send a message to a teammate by name, or use * for all teammates. Choose message_kind: task, handoff, and decision messages prompt a response by default; fyi and ack messages are recorded for message_list without interrupting or restarting recipients. requires_response overrides that default. A task message from team-lead is an explicit work instruction even if the recipient previously completed its tasks.',
+  'Send a message to a teammate by name, or use * for all teammates. Choose message_kind: task, handoff, and decision messages prompt a response by default; fyi and ack messages are recorded for message_list without interrupting recipients. A team-lead broadcast after all tasks are terminal is recorded as a fallback completed final report when team_finalize was omitted.',
   {
     to: nonEmpty,
     message: nonEmpty,
@@ -1183,6 +1226,9 @@ server.tool(
         messageKind: resolvedMessageKind,
         requiresResponse: responseRequired,
       })
+      const automatic_final_report = from === state.team.lead && to === '*'
+        ? await store.finalizeFromLeadBroadcast({ leader: from, summary: message })
+        : undefined
       const recipients = state.members.filter(member =>
         (to === '*' || member.name === to)
         && (member.role === 'teammate' || member.name === state.team.lead)
@@ -1191,6 +1237,7 @@ server.tool(
       if (!responseRequired) {
         return {
           message: stored,
+          automatic_final_report: automatic_final_report ?? null,
           deliveries: recipients.map(member => ({
             name: member.name,
             status: 'recorded_no_prompt' as const,
@@ -1215,7 +1262,7 @@ server.tool(
         const resumed = await resumeMember(member.name, message)
         return { name: member.name, status: 'resumed_and_delivered' as const, ...resumed }
       }))
-      return { message: stored, deliveries }
+      return { message: stored, automatic_final_report: automatic_final_report ?? null, deliveries }
     }),
 )
 

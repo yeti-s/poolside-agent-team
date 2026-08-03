@@ -75,6 +75,18 @@ test('main CLI requires a later approval before tearing down and archiving a sta
     const reportWhileRunning = await request('tools/call', { name: 'team_report', arguments: {} })
     const reportPayload = JSON.parse((reportWhileRunning.result as { content: Array<{ text: string }> }).content[0]!.text)
     assert.equal(reportPayload.status, 'awaiting_leader_report')
+    const state = JSON.parse(await readFile(join(runtime, 'state.json'), 'utf8'))
+    state.team.finalReport = {
+      status: 'completed',
+      finalizedAt: new Date().toISOString(),
+      summary: 'Leader completed the work.',
+      evidence: 'Verified by test.',
+    }
+    await writeFile(join(runtime, 'state.json'), JSON.stringify(state))
+    const waited = await request('tools/call', { name: 'team_wait_for_report', arguments: {} })
+    const waitedPayload = JSON.parse((waited.result as { content: Array<{ text: string }> }).content[0]!.text)
+    assert.equal(waitedPayload.status, 'reported')
+    assert.equal(waitedPayload.final_report.summary, 'Leader completed the work.')
     const planned = await request('tools/call', { name: 'team_teardown_plan', arguments: {} })
     const payload = JSON.parse((planned.result as { content: Array<{ text: string }> }).content[0]!.text) as {
       teardown_id: string

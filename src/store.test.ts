@@ -247,6 +247,23 @@ test('decomposes a stalled task into prioritized focused work', async () => {
   })
 })
 
+test('records a completed lead broadcast as the final-report fallback only after all work is terminal', async () => {
+  await withStore(async store => {
+    await createTeam(store)
+    await store.addMember({ name: 'developer', role: 'teammate', joinedAt: new Date().toISOString(), status: 'running' })
+    const first = await store.addTask({ subject: 'Build UI', description: 'Implement the UI.', owner: 'developer' })
+    const second = await store.addTask({ subject: 'Test UI', description: 'Validate the UI.', owner: 'developer' })
+    await store.updateTask(first.id, { status: 'completed', progressNote: 'Build passed.' })
+    assert.equal(await store.finalizeFromLeadBroadcast({ leader: 'team-lead', summary: 'All work completed.' }), undefined)
+    await store.updateTask(second.id, { status: 'completed', progressNote: 'Tests passed.' })
+    const report = await store.finalizeFromLeadBroadcast({ leader: 'team-lead', summary: 'All work completed.' })
+    assert.equal(report?.status, 'completed')
+    assert.match(report?.evidence ?? '', /All 2 tracked tasks/)
+    assert.equal((await store.read())?.team.finalReport?.summary, 'All work completed.')
+    assert.equal(await store.finalizeFromLeadBroadcast({ leader: 'team-lead', summary: 'Duplicate.' }), undefined)
+  })
+})
+
 test('stores a team plan without creating team state', async () => {
   await withStore(async store => {
     const plan = await store.createPlan({

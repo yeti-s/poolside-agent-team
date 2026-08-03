@@ -66,6 +66,7 @@ test('serves agent-team tools through the MCP stdio protocol', async () => {
     assert.ok(names.includes('team_approve'))
     assert.ok(names.includes('team_finalize'))
     assert.ok(names.includes('team_report'))
+    assert.ok(names.includes('team_wait_for_report'))
     assert.ok(names.includes('team_teardown_plan'))
     assert.ok(names.includes('team_teardown_approve'))
     assert.ok(names.includes('team_resume'))

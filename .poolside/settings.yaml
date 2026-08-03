@@ -27,5 +27,6 @@ mcp_servers:
       - task_decompose
       - team_finalize
       - team_report
+      - team_wait_for_report
       - team_teardown_plan
       - team_teardown_approve

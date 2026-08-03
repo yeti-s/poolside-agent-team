@@ -4,6 +4,7 @@ import type {
   PublicTeamStatus,
   TaskStatus,
   TeamMember,
+  TeamFinalReport,
   TeamMessage,
   TeamState,
   TeamTask,
@@ -219,6 +220,31 @@ export class TeamStore {
       update(state.team)
       return state
     })
+  }
+
+  /**
+   * A completed-team broadcast is the durable fallback when a lead omits the
+   * explicit team_finalize call. It is intentionally accepted only after all
+   * tracked work has reached a terminal state.
+   */
+  async finalizeFromLeadBroadcast(input: { leader: string, summary: string }): Promise<TeamFinalReport | undefined> {
+    let report: TeamFinalReport | undefined
+    await this.mutate(current => {
+      const state = requireTeam(current)
+      if (state.team.lead !== input.leader || state.team.finalReport || state.tasks.length === 0 || hasUnresolvedTasks(state)) return state
+      const completed = state.tasks
+        .map(task => `#${task.id} ${task.subject}: ${(task.lastProgressNote ?? 'completed').slice(0, 500)}`)
+        .join('\n')
+      report = {
+        status: 'completed',
+        finalizedAt: new Date().toISOString(),
+        summary: input.summary.trim(),
+        evidence: `All ${state.tasks.length} tracked tasks reached a terminal state.\n${completed}`.slice(0, 20_000),
+      }
+      state.team.finalReport = report
+      return state
+    })
+    return report
   }
 
   async addTask(input: {
@@ -621,6 +647,10 @@ function getTask(state: TeamState, id: string): TeamTask {
   const task = state.tasks.find(item => item.id === id)
   if (!task) throw new TeamError(`task "${id}" was not found`)
   return task
+}
+
+export function hasUnresolvedTasks(state: TeamState): boolean {
+  return state.tasks.some(task => task.status === 'pending' || task.status === 'in_progress')
 }
 
 function isNotFound(error: unknown): error is NodeJS.ErrnoException {

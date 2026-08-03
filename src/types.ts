@@ -105,6 +105,8 @@ export interface TeamState {
     maxStalledChecks?: number
     /** Written by team-lead when the team has a final outcome for the main CLI. */
     finalReport?: TeamFinalReport
+    /** Last automatic reminder to submit a missing final report. */
+    finalizationReminderAt?: string
     /** Initial task distribution must be completed before this deadline. */
     initialAssignmentDeadlineAt?: string
     /** Last time the leader was interrupted for failing to distribute initial work. */
