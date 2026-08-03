@@ -19,7 +19,6 @@ type WorkerConfig = {
   organizationName?: string
   statePath: string
   role?: 'leader' | 'teammate'
-  leaderSandbox?: { command: string, args: string[] }
 }
 
 const configPath = process.argv[2]
@@ -41,11 +40,7 @@ function workerEnvironment() {
 }
 
 function startPool(args: string[]) {
-  const command = config.leaderSandbox?.command ?? config.poolCommand
-  const commandArgs = config.leaderSandbox
-    ? [...config.leaderSandbox.args, '--', config.poolCommand, ...args]
-    : args
-  return spawn(command, commandArgs, {
+  return spawn(config.poolCommand, args, {
     cwd: config.projectRoot,
     env: workerEnvironment(),
     stdio: 'inherit',
