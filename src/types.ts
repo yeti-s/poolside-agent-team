@@ -1,4 +1,4 @@
-export const TASK_STATUSES = ['pending', 'in_progress', 'completed'] as const
+export const TASK_STATUSES = ['pending', 'in_progress', 'completed', 'decomposed'] as const
 export const MESSAGE_KINDS = ['task', 'handoff', 'decision', 'fyi', 'ack'] as const
 
 export type TaskStatus = (typeof TASK_STATUSES)[number]
@@ -52,6 +52,20 @@ export interface TeamTask {
   lastStallCheckedAt?: string
   /** Set once the watchdog has asked the owner to decompose the task. */
   decompositionRequestedAt?: string
+  /** Child tasks created after this task was interrupted for lack of progress. */
+  decomposedInto?: string[]
+  /** Parent task when this is a focused recovery subtask. */
+  parentTaskId?: string
+  /** Higher values are delivered before ordinary pending work for the same owner. */
+  priority?: number
+}
+
+export interface TeamFinalReport {
+  status: 'completed' | 'blocked'
+  finalizedAt: string
+  summary: string
+  evidence: string
+  blockers?: string
 }
 
 export interface TeamMessage {
@@ -89,6 +103,8 @@ export interface TeamState {
     progressCheckIntervalMinutes?: number
     /** Consecutive unchanged reviews before a task must be decomposed. */
     maxStalledChecks?: number
+    /** Written by team-lead when the team has a final outcome for the main CLI. */
+    finalReport?: TeamFinalReport
   }
   nextTaskNumber: number
   nextMessageNumber: number

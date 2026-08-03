@@ -1,16 +1,14 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
-import { spawnSync } from 'node:child_process'
-import { readFileSync } from 'node:fs'
 import { z } from 'zod'
 import {
   DEFAULT_MAX_MEMBERS,
   DEFAULT_MAX_STALLED_CHECKS,
   DEFAULT_PROGRESS_CHECK_INTERVAL_MINUTES,
   TeamError,
+  type TeamCreationPlan,
   TeamStore,
   assertMember,
-  isTeamHeartbeatStale,
   requireTeam,
   sanitizeTeamName,
   validateMemberName,
@@ -59,11 +57,17 @@ const maxStalledChecks = z.number().int().min(1).max(10)
 let heartbeatTimer: NodeJS.Timeout | undefined
 let progressMonitorTimer: NodeJS.Timeout | undefined
 let progressMonitorInProgress = false
-let leaderSessionForExit: string | undefined
-let cleanupInProgress = false
 
 function callerName(): string {
   return process.env.POOL_AGENT_TEAM_MEMBER || 'team-lead'
+}
+
+function isMainPoolCli(): boolean {
+  return !process.env.POOL_AGENT_TEAM_MEMBER
+}
+
+function requireMainPoolCli(): void {
+  if (!isMainPoolCli()) throw new TeamError('only the main Pool CLI can create, approve, or delete teams')
 }
 
 function isOrganizationWorker(): boolean {
@@ -78,9 +82,19 @@ function requiredOrganizationApproval(planId: string): string {
   return `APPROVE ORGANIZATION ${planId}`
 }
 
+function requiredTeamApproval(planId: string): string {
+  return `APPROVE TEAM ${planId}`
+}
+
 function assertConversationalApproval(planId: string, userApproval: string): void {
   if (userApproval.trim() !== requiredOrganizationApproval(planId)) {
     throw new TeamError(`user_approval must exactly match: ${requiredOrganizationApproval(planId)}`)
+  }
+}
+
+function assertTeamApproval(planId: string, userApproval: string): void {
+  if (userApproval.trim() !== requiredTeamApproval(planId)) {
+    throw new TeamError(`user_approval must exactly match: ${requiredTeamApproval(planId)}`)
   }
 }
 
@@ -173,6 +187,15 @@ async function deliverTaskAssignment(task: {
     state.tasks.find(candidate => candidate.id === id)?.status !== 'completed',
   )
   if (hasIncompleteDependency) return { status: 'queued_until_dependencies_complete' as const }
+  const activeForOwner = state.tasks.some(candidate =>
+    candidate.owner === task.owner && candidate.status === 'in_progress',
+  )
+  if (activeForOwner) return { status: 'queued_while_owner_is_busy' as const }
+  const nextForOwner = state.tasks
+    .filter(candidate => candidate.owner === task.owner && candidate.status === 'pending')
+    .filter(candidate => candidate.blockedBy.every(id => state.tasks.find(item => item.id === id)?.status === 'completed'))
+    .sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0) || Number(a.id) - Number(b.id))[0]
+  if (nextForOwner?.id !== task.id) return { status: 'queued_for_owner_priority' as const }
   const message = buildTaskAssignmentMessage(task)
   const stored = await store.addMessage({
     from,
@@ -208,8 +231,19 @@ async function deliverNewlyUnblockedTasks(completedTaskId: string, from: string)
   return Promise.all(candidates.map(task => deliverTaskAssignment(task, from)))
 }
 
+async function deliverOwnerNextTask(owner: string | undefined, from: string) {
+  if (!owner) return []
+  const state = await currentState()
+  const candidates = state.tasks
+    .filter(task => task.owner === owner && task.status === 'pending')
+    .filter(task => task.blockedBy.every(id => state.tasks.find(item => item.id === id)?.status === 'completed'))
+    .sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0) || Number(a.id) - Number(b.id))
+  if (!candidates[0]) return []
+  return [await deliverTaskAssignment(candidates[0], from)]
+}
+
 function memberWorkStatus(memberName: string, state: Awaited<ReturnType<typeof currentState>>) {
-  const owned = state.tasks.filter(task => task.owner === memberName && task.status !== 'completed')
+  const owned = state.tasks.filter(task => task.owner === memberName && task.status !== 'completed' && task.status !== 'decomposed')
   const active = owned.filter(task => task.status === 'in_progress')
   if (active.length > 0) return { status: 'working' as const, taskIds: active.map(task => task.id) }
   const pending = owned.filter(task => task.status === 'pending')
@@ -234,9 +268,8 @@ function progressReminderPrompt(task: { id: string, subject: string }, intervalM
 function decompositionPrompt(task: { id: string, subject: string }, intervalMinutes: number, checks: number): string {
   return [
     `Automated team-lead escalation: task #${task.id} "${task.subject}" remained unchanged across ${checks} consecutive ${intervalMinutes}-minute reviews.`,
-    'Stop the current unproductive reasoning now. Break this work into 2-4 small, independently verifiable steps.',
-    'Create or update shared tasks for those steps, include concrete acceptance criteria, and begin only the smallest next step. Record the decomposition/progress with task_update and report it to team-lead with message_send.',
-    'Do not resume broad analysis of the original task until the smaller next step has a result or a specific blocker.',
+    'The owner has been interrupted. Use task_decompose now to create 2-4 small, independently verifiable child tasks with concrete acceptance criteria.',
+    'The child tasks will be delivered before this owner’s ordinary pending work. Do not resume the original broad task.',
   ].join('\n')
 }
 
@@ -263,19 +296,16 @@ async function runLeaderProgressMonitor(): Promise<void> {
       const prompt = review.status === 'decompose'
         ? decompositionPrompt(review.task, intervalMinutes, review.task.stalledCheckCount ?? maxChecks)
         : progressReminderPrompt(review.task, intervalMinutes)
-      await store.addMessage({
-        from: state.team.lead,
-        to: owner.name,
-        body: prompt,
-        messageKind: 'task',
-        requiresResponse: true,
-      })
+      const recipient = review.status === 'decompose' ? state.team.lead : owner.name
+      await store.addMessage({ from: state.team.lead, to: recipient, body: prompt, messageKind: 'task', requiresResponse: true })
       // A decomposition request must preempt an endless thinking turn before
       // the instruction is entered into the interactive Pool session.
       if (review.status === 'decompose') {
         await interruptTmuxPane(owner.tmuxPaneId).catch(() => undefined)
+        await sendPromptToTmuxPane(owner.tmuxPaneId, 'Your stalled task has been paused. Wait for team-lead to assign focused recovery work.').catch(() => undefined)
       }
-      await sendPromptToTmuxPane(owner.tmuxPaneId, prompt)
+      const recipientMember = members.get(recipient)
+      if (recipientMember?.tmuxPaneId) await sendPromptToTmuxPane(recipientMember.tmuxPaneId, prompt)
     }
   } catch {
     // Monitoring is best effort. Subsequent intervals retry transient tmux or
@@ -286,7 +316,7 @@ async function runLeaderProgressMonitor(): Promise<void> {
 }
 
 async function startLeaderProgressMonitor(): Promise<void> {
-  if (progressMonitorTimer) return
+  if (isMainPoolCli() || progressMonitorTimer) return
   const state = await store.read()
   if (!state || state.team.lead !== callerName()) return
   const intervalMinutes = state.team.progressCheckIntervalMinutes ?? DEFAULT_PROGRESS_CHECK_INTERVAL_MINUTES
@@ -357,55 +387,34 @@ async function requireLead(): Promise<void> {
 }
 
 function startLeaderHeartbeat(): void {
-  if (callerName() !== 'team-lead' || heartbeatTimer) return
-  heartbeatTimer = setInterval(() => {
-    void store.updateTeam(team => {
+  if (heartbeatTimer || isMainPoolCli()) return
+  void (async () => {
+    const state = await store.read()
+    if (!state || state.team.lead !== callerName() || heartbeatTimer) return
+    await store.updateTeam(team => {
+      team.leaderPid = process.ppid
       team.heartbeatAt = new Date().toISOString()
-    }).catch(() => undefined)
-  }, 2_000)
-  heartbeatTimer.unref()
+    })
+    heartbeatTimer = setInterval(() => {
+      void store.updateTeam(team => {
+        team.heartbeatAt = new Date().toISOString()
+      }).catch(() => undefined)
+    }, 2_000)
+    heartbeatTimer.unref()
+  })().catch(() => undefined)
 }
 
 async function cleanupLeaderTeam(): Promise<void> {
-  if (callerName() !== 'team-lead' || cleanupInProgress) return
-  cleanupInProgress = true
+  if (isMainPoolCli()) return
   if (heartbeatTimer) clearInterval(heartbeatTimer)
   heartbeatTimer = undefined
   stopLeaderProgressMonitor()
-  try {
-    const state = await store.read()
-    if (!state || state.team.leaderPid !== process.ppid) return
-    await killTeamTmuxSession(state.team.tmuxSession)
-  } finally {
-    cleanupInProgress = false
-  }
-}
-
-function cleanStaleTeamSynchronously(): void {
-  if (!leaderSessionForExit) return
-  // `team_adopt` may have handed ownership to a replacement Pool CLI.  The
-  // old MCP process still receives an exit event, so verify ownership again
-  // before it removes the shared tmux session.
-  try {
-    const state = JSON.parse(readFileSync(store.statePath, 'utf8')) as {
-      team?: { leaderPid?: number }
-    }
-    if (state.team?.leaderPid !== process.ppid) return
-  } catch {
-    return
-  }
-  spawnSync(process.env.POOL_AGENT_TEAM_TMUX_COMMAND || 'tmux', [
-    'kill-session',
-    '-t',
-    leaderSessionForExit,
-  ], { stdio: 'ignore' })
 }
 
 process.once('SIGINT', () => void cleanupLeaderTeam().finally(() => process.exit(0)))
 process.once('SIGTERM', () => void cleanupLeaderTeam().finally(() => process.exit(0)))
 process.once('SIGHUP', () => void cleanupLeaderTeam().finally(() => process.exit(0)))
 process.stdin.once('end', () => void cleanupLeaderTeam().finally(() => process.exit(0)))
-process.once('exit', cleanStaleTeamSynchronously)
 
 const plannedMember = z.object({
   name: nonEmpty,
@@ -433,7 +442,8 @@ server.tool(
   },
   async ({ organization_name, description, teams }) =>
     execute(async () => {
-      if (isOrganizationWorker()) throw new TeamError('only organization-lead can create an organization plan')
+      requireMainPoolCli()
+      if (isOrganizationWorker()) throw new TeamError('only the main Pool CLI can create an organization plan')
       const plan = await organizationStore.createPlan(normalizePlan({
         organizationName: organization_name,
         description,
@@ -490,7 +500,8 @@ server.tool(
   },
   async ({ plan_id, user_approval }) =>
     execute(async () => {
-      if (isOrganizationWorker()) throw new TeamError('only organization-lead can approve an organization plan')
+      requireMainPoolCli()
+      if (isOrganizationWorker()) throw new TeamError('only the main Pool CLI can approve an organization plan')
       if (await organizationStore.read()) throw new TeamError('an organization already exists in this project')
       const plan = await organizationStore.getPlan(plan_id)
       assertConversationalApproval(plan.id, user_approval)
@@ -629,7 +640,8 @@ server.tool(
   'Terminate every team tmux session and remove organization state. Only organization-lead can call this.',
   {},
   async () => execute(async () => {
-    if (isOrganizationWorker()) throw new TeamError('only organization-lead can delete an organization')
+    requireMainPoolCli()
+    if (isOrganizationWorker()) throw new TeamError('only the main Pool CLI can delete an organization')
     const state = await organizationStore.read()
     if (!state) throw new TeamError('no organization exists in this project')
     await Promise.all(state.teams.map(team => killTeamTmuxSession(team.tmuxSession)))
@@ -638,83 +650,129 @@ server.tool(
   }),
 )
 
+function normalizeStandalonePlan(input: {
+  teamName: string
+  description?: string
+  leader: { name: string, prompt: string, agentName?: string, model?: string }
+  teammates: Array<{ name: string, prompt: string, agentName?: string, model?: string }>
+  maxMembers?: number
+  progressCheckIntervalMinutes?: number
+  maxStalledChecks?: number
+}): Omit<TeamCreationPlan, 'id' | 'createdAt'> {
+  const leader = { ...input.leader, name: validateMemberName(input.leader.name), prompt: input.leader.prompt.trim() }
+  const teammates = input.teammates.map(member => ({ ...member, name: validateMemberName(member.name), prompt: member.prompt.trim() }))
+  const names = new Set([leader.name])
+  for (const teammate of teammates) {
+    if (names.has(teammate.name)) throw new TeamError(`duplicate member "${teammate.name}" in team plan`)
+    names.add(teammate.name)
+  }
+  const max = input.maxMembers ?? Math.max(DEFAULT_MAX_MEMBERS, names.size)
+  if (max < names.size) throw new TeamError('max_members must include every planned member')
+  return {
+    teamName: sanitizeTeamName(input.teamName),
+    description: input.description?.trim(),
+    leader,
+    teammates,
+    maxMembers: max,
+    progressCheckIntervalMinutes: input.progressCheckIntervalMinutes,
+    maxStalledChecks: input.maxStalledChecks,
+  }
+}
+
 server.tool(
-  'team_create',
-  'Create a shared Pool agent team and its task/message state. The leader watchdog checks in-progress teammate tasks every five minutes by default, then interrupts and requires decomposition after two unchanged checks.',
+  'team_plan',
+  'Save a complete standalone team composition without starting tmux or Pool workers. Show the plan to the user and call team_approve only after a later explicit approval.',
   {
-    team_name: nonEmpty.describe('A unique, filesystem-safe team name.'),
+    team_name: nonEmpty,
     description: nonEmpty.optional(),
-    leader_name: z.literal('team-lead').describe('Required leader for a standalone team. The creating Pool session is team-lead.'),
-    max_members: maxMembers.optional().describe('Maximum team size including team-lead. Defaults to 4.'),
-    progress_check_interval_minutes: progressCheckIntervalMinutes.optional().describe('Leader watchdog review cadence. Defaults to 5 minutes.'),
-    stalled_check_limit: maxStalledChecks.optional().describe('Unchanged reviews before automatic interrupt and task decomposition. Defaults to 2.'),
+    leader: plannedMember,
+    teammates: z.array(plannedMember).min(1),
+    max_members: maxMembers.optional(),
+    progress_check_interval_minutes: progressCheckIntervalMinutes.optional(),
+    stalled_check_limit: maxStalledChecks.optional(),
   },
-  async ({ team_name, description, max_members, progress_check_interval_minutes, stalled_check_limit }) =>
+  async ({ team_name, description, leader, teammates, max_members, progress_check_interval_minutes, stalled_check_limit }) =>
     execute(async () => {
-      if (isOrganizationWorker()) throw new TeamError('create additional teams through an approved organization plan')
-      if (callerName() !== 'team-lead') throw new TeamError('a teammate cannot create a team')
-      const existing = await store.read()
-      if (existing) {
-        const leaderIsAlive = existing.team.leaderPid ? isProcessAlive(existing.team.leaderPid) : false
-        if (!leaderIsAlive && isTeamHeartbeatStale(existing)) {
-          await killTeamTmuxSession(existing.team.tmuxSession)
-          await store.remove()
-        } else {
-          throw new TeamError(`team "${existing.team.name}" already exists`)
-        }
-      }
-      await assertTmuxAvailable()
-      const normalizedTeamName = sanitizeTeamName(team_name)
-      const tmuxSession = teamTmuxSessionName(normalizedTeamName)
-      const state = await store.create({
-        teamName: normalizedTeamName,
+      requireMainPoolCli()
+      if (isOrganizationWorker()) throw new TeamError('standalone team plans are unavailable in organization workers')
+      if (await store.read()) throw new TeamError('a team already exists in this project; delete it explicitly before planning another')
+      const plan = await store.createPlan(normalizeStandalonePlan({
+        teamName: team_name,
         description,
-        maxMembers: max_members ?? DEFAULT_MAX_MEMBERS,
-        tmuxSession,
-        leaderPid: process.ppid,
-        leaderName: 'team-lead',
+        leader: { name: leader.name, prompt: leader.prompt, agentName: leader.agent_name, model: leader.model },
+        teammates: teammates.map(member => ({ name: member.name, prompt: member.prompt, agentName: member.agent_name, model: member.model })),
+        maxMembers: max_members,
         progressCheckIntervalMinutes: progress_check_interval_minutes,
         maxStalledChecks: stalled_check_limit,
-      })
-      try {
-        await createTeamTmuxSession({
-          session: tmuxSession,
-          projectRoot,
-          statePath: store.statePath,
-        })
-        const watchdogPid = startTeamWatchdog({ statePath: store.statePath, session: tmuxSession })
-        await store.updateTeam(team => {
-          team.watchdogPid = watchdogPid
-        })
-        // The creating Pool session cannot receive asynchronous MCP prompts.
-        // Run the coordinating leader in tmux so teammate reports can wake it.
+      }))
+      return {
+        status: 'awaiting_user_approval',
+        plan_id: plan.id,
+        team: { name: plan.teamName, leader: plan.leader.name, teammates: plan.teammates.map(member => member.name), max_members: plan.maxMembers },
+        required_user_approval: requiredTeamApproval(plan.id),
+      }
+    }),
+)
+
+server.tool(
+  'team_approve',
+  'Create the exact planned standalone team only after a later user message contains the required approval statement.',
+  { plan_id: nonEmpty, user_approval: nonEmpty },
+  async ({ plan_id, user_approval }) => execute(async () => {
+    requireMainPoolCli()
+    if (await store.read()) throw new TeamError('a team already exists in this project')
+    const plan = await store.getPlan(plan_id)
+    assertTeamApproval(plan.id, user_approval)
+    await assertTmuxAvailable()
+    const tmuxSession = teamTmuxSessionName(plan.teamName)
+    const state = await store.create({
+      teamName: plan.teamName,
+      description: plan.description,
+      maxMembers: plan.maxMembers,
+      tmuxSession,
+      leaderPid: process.ppid,
+      leaderName: plan.leader.name,
+      progressCheckIntervalMinutes: plan.progressCheckIntervalMinutes,
+      maxStalledChecks: plan.maxStalledChecks,
+    })
+    try {
+      await createTeamTmuxSession({ session: tmuxSession, projectRoot, statePath: store.statePath })
+      const watchdogPid = startTeamWatchdog({ statePath: store.statePath, session: tmuxSession })
+      await store.updateTeam(team => { team.watchdogPid = watchdogPid })
+      await spawnPoolWorker({
+        name: plan.leader.name,
+        prompt: buildStandaloneLeaderPrompt(plan.description),
+        teamName: state.team.name,
+        tmuxSession,
+        projectRoot,
+        role: 'leader',
+        agentName: plan.leader.agentName,
+        model: plan.leader.model,
+        replaceExisting: true,
+        waitForSessionId: false,
+      }, store)
+      for (const teammate of plan.teammates) {
         await spawnPoolWorker({
-          name: state.team.lead,
-          prompt: buildStandaloneLeaderPrompt(description),
+          name: teammate.name,
+          prompt: teammate.prompt,
           teamName: state.team.name,
           tmuxSession,
           projectRoot,
-          role: 'leader',
-          replaceExisting: true,
-          waitForSessionId: false,
+          agentName: teammate.agentName,
+          model: teammate.model,
         }, store)
-      } catch (error) {
-        await store.remove()
-        throw error
       }
-      leaderSessionForExit = tmuxSession
-      startLeaderHeartbeat()
-      await startLeaderProgressMonitor()
-      return {
-        team_name: state.team.name,
-        state_path: store.statePath,
-        lead_agent: state.team.lead,
-        max_members: state.team.maxMembers,
-        tmux_session: tmuxSession,
-        progress_check_interval_minutes: state.team.progressCheckIntervalMinutes,
-        stalled_check_limit: state.team.maxStalledChecks,
-      }
-    }),
+    } catch (error) {
+      await killTeamTmuxSession(tmuxSession)
+      await store.remove()
+      throw error
+    }
+    return { status: 'running', team_name: state.team.name, tmux_session: tmuxSession, lead_agent: plan.leader.name }
+  }),
+)
+
+server.tool('team_create', 'Deprecated. Use team_plan and team_approve so the user can approve the complete team composition.', {}, async () =>
+  execute(async () => { throw new TeamError('team_create is disabled; use team_plan followed by team_approve') }),
 )
 
 server.tool('team_list', 'List the currently configured team and all members.', {}, async () =>
@@ -727,12 +785,13 @@ server.tool('team_list', 'List the currently configured team and all members.', 
 
 server.tool(
   'team_adopt',
-  'Transfer team-lead ownership to this Pool session. Use after restarting the lead CLI so the previous lead process cannot clean up the tmux team on exit. Set force only when the recorded leader process is still alive.',
+  'Transfer team-lead ownership to this Pool session after an explicit leader recovery. The team remains preserved when the prior leader exits. Set force only when the recorded leader process is still alive.',
   { force: z.boolean().optional().describe('Required to take over from a still-running recorded leader.') },
   async ({ force }) =>
     execute(async () => {
       if (isOrganizationWorker()) throw new TeamError('organization team leadership is managed by the organization')
-      if (callerName() !== 'team-lead') throw new TeamError('only team-lead can adopt a team')
+      if (isMainPoolCli()) throw new TeamError('the main Pool CLI does not adopt team leadership')
+      await requireLead()
       const state = await currentState()
       const previousLeaderPid = state.team.leaderPid
       if (previousLeaderPid && previousLeaderPid !== process.ppid && isProcessAlive(previousLeaderPid) && !force) {
@@ -742,7 +801,6 @@ server.tool(
         team.leaderPid = process.ppid
         team.heartbeatAt = new Date().toISOString()
       })
-      leaderSessionForExit = state.team.tmuxSession
       startLeaderHeartbeat()
       await startLeaderProgressMonitor()
       return {
@@ -784,46 +842,55 @@ server.tool('team_status', 'Show worker-process liveness separately from each te
 )
 
 server.tool(
+  'team_report',
+  'Read the latest team outcome and task summary. Only the main Pool CLI may read the final report for user handoff.',
+  {},
+  async () => execute(async () => {
+    requireMainPoolCli()
+    const state = requireTeam(await store.read())
+    const task_summary = state.tasks.reduce<Record<string, number>>((summary, task) => {
+      summary[task.status] = (summary[task.status] ?? 0) + 1
+      return summary
+    }, {})
+    return { team: state.team, task_summary, final_report: state.team.finalReport ?? null }
+  }),
+)
+
+server.tool(
+  'team_finalize',
+  'Record the final team outcome for the main Pool CLI. Only team-lead can finalize; this never deletes the team.',
+  {
+    status: z.enum(['completed', 'blocked']),
+    summary: nonEmpty,
+    evidence: nonEmpty,
+    blockers: nonEmpty.optional(),
+  },
+  async ({ status, summary, evidence, blockers }) => execute(async () => {
+    await requireLead()
+    const state = await currentState()
+    const unresolved = state.tasks.filter(task => task.status === 'pending' || task.status === 'in_progress')
+    if (status === 'completed' && unresolved.length > 0) {
+      throw new TeamError(`cannot finalize completed while tasks remain active: ${unresolved.map(task => task.id).join(', ')}`)
+    }
+    if (status === 'blocked' && !blockers?.trim()) throw new TeamError('blocked final reports require blockers')
+    const report = { status, finalizedAt: new Date().toISOString(), summary: summary.trim(), evidence: evidence.trim(), blockers: blockers?.trim() }
+    await store.updateTeam(team => { team.finalReport = report })
+    return { finalized: true, report }
+  }),
+)
+
+server.tool(
   'team_spawn',
-  'Start an interactive Pool teammate in a pane of the shared tmux team window.',
+  'Disabled. Team members must be included in a user-approved team plan.',
   {
     name: nonEmpty.describe('Unique teammate name, such as researcher or tester.'),
     prompt: nonEmpty.describe('Concrete outcome and scope for the teammate.'),
     agent_name: nonEmpty.optional().describe('Optional teammate metadata; interactive Pool does not use it to select an agent.'),
     model: nonEmpty.optional().describe('Optional Pool model for the interactive teammate session.'),
   },
-  async ({ name, prompt, agent_name, model }) =>
-    execute(async () => {
-      await requireLead()
-      const state = await currentState()
-      const memberName = validateMemberName(name)
-      if (state.members.some(member => member.name === memberName)) {
-        throw new TeamError(`member "${memberName}" already exists`)
-      }
-      const input = {
-        name: memberName,
-        prompt,
-        teamName: state.team.name,
-        tmuxSession: state.team.tmuxSession,
-        projectRoot,
-        organizationName,
-        runtimeDirectory: organizationName
-          ? organizationStore.teamRuntimeDirectory(organizationName, state.team.name)
-          : undefined,
-        agentName: agent_name,
-        model,
-      }
-      const spawned = await spawnPoolWorker(input, store)
-      return {
-        name: memberName,
-        pid: spawned.pid,
-        log_path: spawned.logPath,
-        team_name: state.team.name,
-        tmux_session: state.team.tmuxSession,
-        tmux_window: spawned.tmuxWindow,
-        tmux_pane_id: spawned.tmuxPaneId,
-      }
-    }),
+  async () => execute(async () => {
+    throw new TeamError('team_spawn is disabled; include every member in team_plan before approval')
+  }),
 )
 
 server.tool(
@@ -838,7 +905,8 @@ server.tool(
   },
   async ({ subject, description, owner, blocks, depends_on }) =>
     execute(async () => {
-      const from = await requireCaller()
+      await requireLead()
+      const from = callerName()
       const task = await store.addTask({ subject, description, owner, blocks, dependsOn: depends_on })
       const assignment_delivery = await deliverTaskAssignment(task, from)
       return { ...task, assignment_delivery }
@@ -870,6 +938,15 @@ server.tool(
     execute(async () => {
       const from = await requireCaller()
       const before = (await currentState()).tasks.find(item => item.id === task_id)
+      if (!before) throw new TeamError(`task "${task_id}" was not found`)
+      const leader = (await currentState()).team.lead
+      if (from !== leader) {
+        if (before.owner !== from) throw new TeamError('teammates may update only their own tasks')
+        if (subject !== undefined || description !== undefined || owner !== undefined || blocks !== undefined || depends_on !== undefined) {
+          throw new TeamError('teammates cannot change task assignment, content, or dependencies')
+        }
+        if (status === 'decomposed') throw new TeamError('only team-lead can decompose a task')
+      }
       if (status === 'in_progress' && owner === undefined) {
         const state = await currentState()
         const task = state.tasks.find(item => item.id === task_id)
@@ -890,11 +967,42 @@ server.tool(
       const unblocked_deliveries = task.status === 'completed' && before?.status !== 'completed'
         ? await deliverNewlyUnblockedTasks(task.id, from)
         : []
+      const next_owner_deliveries = task.status === 'completed' && before?.status !== 'completed'
+        ? await deliverOwnerNextTask(before.owner, from)
+        : []
       const leader_completion_delivery = task.status === 'completed' && before?.status !== 'completed'
         ? await notifyLeaderOfTaskCompletion(task, from)
         : { status: 'not_required' as const }
-      return { ...task, assignment_delivery, unblocked_deliveries, leader_completion_delivery }
+      return { ...task, assignment_delivery, unblocked_deliveries, next_owner_deliveries, leader_completion_delivery }
     }),
+)
+
+server.tool(
+  'task_decompose',
+  'Interrupt recovery for a stalled task. Only team-lead may split it into 2-4 focused child tasks; children receive priority over the owner’s ordinary pending work.',
+  {
+    task_id: nonEmpty,
+    children: z.array(z.object({
+      subject: nonEmpty,
+      description: nonEmpty,
+      owner: nonEmpty,
+      depends_on: z.array(nonEmpty).optional(),
+    })).min(2).max(4),
+  },
+  async ({ task_id, children }) => execute(async () => {
+    await requireLead()
+    const decomposition = await store.decomposeTask({
+      taskId: task_id,
+      children: children.map(child => ({
+        subject: child.subject,
+        description: child.description,
+        owner: child.owner,
+        dependsOn: child.depends_on,
+      })),
+    })
+    const deliveries = await Promise.all(decomposition.children.map(child => deliverTaskAssignment(child, callerName())))
+    return { ...decomposition, deliveries }
+  }),
 )
 
 server.tool(
@@ -1007,44 +1115,28 @@ server.tool(
 
 server.tool(
   'team_request_shutdown',
-  'Request that a teammate finish safely and exit. This is cooperative and does not kill the process.',
+  'Disabled for team workers. The main Pool CLI controls team lifecycle through explicit deletion.',
   { name: nonEmpty },
-  async ({ name }) =>
-    execute(async () => {
-      await requireLead()
-      const memberName = validateMemberName(name)
-      const state = await currentState()
-      if (memberName === state.team.lead) throw new TeamError('team-lead cannot request its own shutdown')
-      await store.updateMember(memberName, member => {
-        member.status = 'shutdown_requested'
-      })
-      return store.addMessage({
-        from: state.team.lead,
-        to: memberName,
-        kind: 'system',
-        body: 'Shutdown requested: finish or safely stop your current work, update your task, and exit.',
-      })
-    }),
+  async () => execute(async () => {
+    throw new TeamError('team_request_shutdown is disabled; only the main Pool CLI may delete a team')
+  }),
 )
 
 server.tool(
   'team_delete',
-  'Terminate all teammate panes and delete the team state.',
+  'Terminate all team panes and delete the team state. Only the main Pool CLI may call this explicit lifecycle action.',
   {},
   async () =>
     execute(async () => {
+      requireMainPoolCli()
       if (isOrganizationWorker()) throw new TeamError('use organization_delete to remove an organization')
-      await requireLead()
       const state = await currentState()
       await killTeamTmuxSession(state.team.tmuxSession)
       await store.remove()
-      if (heartbeatTimer) clearInterval(heartbeatTimer)
-      heartbeatTimer = undefined
-      stopLeaderProgressMonitor()
-      leaderSessionForExit = undefined
       return { deleted: true, team_name: state.team.name }
     }),
 )
 
 await server.connect(new StdioServerTransport())
+startLeaderHeartbeat()
 void startLeaderProgressMonitor()

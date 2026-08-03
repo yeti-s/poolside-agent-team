@@ -324,7 +324,7 @@ function buildWorkerPrompt(input: SpawnWorkerInput): string {
     'A later direct coordination message from team-lead is an explicit task assignment, even when task_list has no unfinished task assigned to you. Execute it and report the result with message_send; do not dismiss it because earlier work is complete.',
     'After completing work, call task_update to mark it completed when there is a matching task, send a concise message to the requester or team-lead, then remain available for a later coordination message. Only leave the team after an explicit shutdown request.',
     input.role === 'leader'
-      ? 'You may create and manage teammates only in your own team. Use organization_message_send only to exchange opinions with another team leader. Do not contact another team\'s teammates directly.'
+      ? 'You manage only the approved members already present: assign, update, interrupt, decompose, and finalize work. You cannot create, remove, or shut down teammates or delete the team. Use organization_message_send only to exchange opinions with another team leader. Do not contact another team\'s teammates directly.'
       : 'You cannot create teammates or delete the team. Do not communicate with members outside your own team.',
     'Do not modify files outside the requested project.',
     '',

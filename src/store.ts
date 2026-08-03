@@ -21,6 +21,25 @@ export interface TaskProgressCheck {
   status: 'active' | 'remind' | 'decompose' | 'already_escalated'
 }
 
+export interface PlannedTeamMember {
+  name: string
+  prompt: string
+  agentName?: string
+  model?: string
+}
+
+export interface TeamCreationPlan {
+  id: string
+  teamName: string
+  description?: string
+  leader: PlannedTeamMember
+  teammates: PlannedTeamMember[]
+  maxMembers: number
+  progressCheckIntervalMinutes?: number
+  maxStalledChecks?: number
+  createdAt: string
+}
+
 export class TeamError extends Error {}
 
 export function sanitizeTeamName(name: string): string {
@@ -42,10 +61,36 @@ export function validateMemberName(name: string): string {
 export class TeamStore {
   readonly statePath: string
   private readonly lockPath: string
+  private readonly planPath: string
 
   constructor(readonly projectRoot: string, statePath?: string) {
     this.statePath = statePath ?? join(projectRoot, '.poolside', 'agent-team', 'state.json')
     this.lockPath = join(dirname(this.statePath), 'state.lock')
+    this.planPath = join(dirname(this.statePath), 'plans.json')
+  }
+
+  async createPlan(input: Omit<TeamCreationPlan, 'id' | 'createdAt'>): Promise<TeamCreationPlan> {
+    const release = await this.acquireLock()
+    try {
+      const plans = await this.readPlans()
+      const plan: TeamCreationPlan = {
+        ...input,
+        id: `team-plan-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        createdAt: new Date().toISOString(),
+      }
+      plans.push(plan)
+      await mkdir(dirname(this.planPath), { recursive: true })
+      await writeFile(this.planPath, `${JSON.stringify(plans, null, 2)}\n`, 'utf8')
+      return plan
+    } finally {
+      await release()
+    }
+  }
+
+  async getPlan(id: string): Promise<TeamCreationPlan> {
+    const plan = (await this.readPlans()).find(item => item.id === id)
+    if (!plan) throw new TeamError(`team plan "${id}" was not found`)
+    return plan
   }
 
   async read(): Promise<TeamState | undefined> {
@@ -125,6 +170,15 @@ export class TeamStore {
     }
   }
 
+  private async readPlans(): Promise<TeamCreationPlan[]> {
+    try {
+      return JSON.parse(await readFile(this.planPath, 'utf8')) as TeamCreationPlan[]
+    } catch (error: unknown) {
+      if (isNotFound(error)) return []
+      throw error
+    }
+  }
+
   async addMember(member: TeamMember): Promise<TeamState> {
     return this.mutate(current => {
       const state = requireTeam(current)
@@ -171,6 +225,8 @@ export class TeamStore {
     owner?: string
     blocks?: string[]
     dependsOn?: string[]
+    parentTaskId?: string
+    priority?: number
   }): Promise<TeamTask> {
     let created!: TeamTask
     await this.mutate(current => {
@@ -189,6 +245,8 @@ export class TeamStore {
         owner: input.owner,
         blocks,
         blockedBy: [...new Set(dependsOn)],
+        parentTaskId: input.parentTaskId,
+        priority: input.priority ?? 0,
         createdAt: now,
         updatedAt: now,
         lastProgressAt: now,
@@ -202,6 +260,58 @@ export class TeamStore {
       return state
     })
     return created
+  }
+
+  async decomposeTask(input: {
+    taskId: string
+    children: Array<{ subject: string, description: string, owner: string, dependsOn?: string[] }>
+  }): Promise<{ parent: TeamTask, children: TeamTask[] }> {
+    let result!: { parent: TeamTask, children: TeamTask[] }
+    await this.mutate(current => {
+      const state = requireTeam(current)
+      const parent = getTask(state, input.taskId)
+      if (parent.status === 'completed' || parent.status === 'decomposed') {
+        throw new TeamError(`task "${parent.id}" cannot be decomposed from status "${parent.status}"`)
+      }
+      if (input.children.length < 2 || input.children.length > 4) {
+        throw new TeamError('a decomposition must contain between 2 and 4 child tasks')
+      }
+      const now = new Date().toISOString()
+      const children: TeamTask[] = []
+      for (const childInput of input.children) {
+        assertMember(state, childInput.owner)
+        const dependsOn = [...new Set(childInput.dependsOn ?? [])]
+        if (dependsOn.includes(parent.id)) throw new TeamError('a decomposition child cannot depend on its parent')
+        assertTaskIds(state, dependsOn)
+        const child: TeamTask = {
+          id: String(state.nextTaskNumber++),
+          subject: childInput.subject.trim(),
+          description: childInput.description.trim(),
+          status: 'pending',
+          owner: childInput.owner,
+          blocks: [],
+          blockedBy: dependsOn,
+          parentTaskId: parent.id,
+          priority: 100,
+          createdAt: now,
+          updatedAt: now,
+          lastProgressAt: now,
+          lastProgressNote: `Created from stalled task #${parent.id}`,
+        }
+        state.tasks.push(child)
+        children.push(child)
+      }
+      parent.status = 'decomposed'
+      parent.decomposedInto = children.map(child => child.id)
+      parent.updatedAt = now
+      parent.lastProgressAt = now
+      parent.lastProgressNote = `Interrupted and decomposed into tasks: ${parent.decomposedInto.join(', ')}`
+      parent.stalledCheckCount = 0
+      parent.lastStallCheckedAt = undefined
+      result = { parent: structuredClone(parent), children: structuredClone(children) }
+      return state
+    })
+    return result
   }
 
   async updateTask(
@@ -376,6 +486,7 @@ export class TeamStore {
       pending: 0,
       in_progress: 0,
       completed: 0,
+      decomposed: 0,
     }
     for (const task of state.tasks) taskSummary[task.status] += 1
     return {
@@ -435,7 +546,7 @@ export class TeamStore {
 }
 
 export function requireTeam(state: TeamState | undefined): TeamState {
-  if (!state) throw new TeamError('no team exists in this project; call team_create first')
+  if (!state) throw new TeamError('no team exists in this project; create an approved plan with team_plan, then call team_approve')
   return state
 }
 

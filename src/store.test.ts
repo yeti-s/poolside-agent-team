@@ -215,6 +215,38 @@ test('tracks unchanged work and requests decomposition after repeated leader rev
   })
 })
 
+test('decomposes a stalled task into prioritized focused work', async () => {
+  await withStore(async store => {
+    await createTeam(store)
+    await store.addMember({ name: 'developer', role: 'teammate', joinedAt: new Date().toISOString(), status: 'running' })
+    const parent = await store.addTask({ subject: 'Build chat', description: 'Implement the whole feature', owner: 'developer' })
+    await store.updateTask(parent.id, { status: 'in_progress' })
+    const result = await store.decomposeTask({
+      taskId: parent.id,
+      children: [
+        { subject: 'Define API', description: 'Write the narrow API contract', owner: 'developer' },
+        { subject: 'Implement API', description: 'Implement against the contract', owner: 'developer' },
+      ],
+    })
+    assert.equal(result.parent.status, 'decomposed')
+    assert.deepEqual(result.parent.decomposedInto, result.children.map(child => child.id))
+    assert.ok(result.children.every(child => child.parentTaskId === parent.id && child.priority === 100))
+  })
+})
+
+test('stores a team plan without creating team state', async () => {
+  await withStore(async store => {
+    const plan = await store.createPlan({
+      teamName: 'planned-team',
+      leader: { name: 'team-lead', prompt: 'Coordinate approved work.' },
+      teammates: [{ name: 'developer', prompt: 'Implement focused work.' }],
+      maxMembers: 2,
+    })
+    assert.equal(await store.read(), undefined)
+    assert.equal((await store.getPlan(plan.id)).teamName, 'planned-team')
+  })
+})
+
 test('serializes concurrent task creation without reusing IDs', async () => {
   await withStore(async store => {
     await createTeam(store)

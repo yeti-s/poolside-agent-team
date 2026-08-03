@@ -17,14 +17,6 @@ async function sessionExists(): Promise<boolean> {
   }
 }
 
-async function stopSession(): Promise<void> {
-  try {
-    await execFileAsync(tmuxCommand, ['kill-session', '-t', session])
-  } catch {
-    // The leader cleanup may have already removed the session.
-  }
-}
-
 const timer = setInterval(async () => {
   if (!(await sessionExists())) {
     clearInterval(timer)
@@ -36,11 +28,12 @@ const timer = setInterval(async () => {
     }
     const heartbeatAt = Date.parse(state.team?.heartbeatAt ?? '')
     if (!Number.isFinite(heartbeatAt) || Date.now() - heartbeatAt > LEADER_HEARTBEAT_TIMEOUT_MS) {
-      await stopSession()
+      // A stalled or exited leader is recoverable. Only the main Pool CLI may
+      // terminate a team, so preserve the tmux session and shared state.
       clearInterval(timer)
     }
   } catch {
-    await stopSession()
+    // Missing or unreadable state must never turn into an implicit team delete.
     clearInterval(timer)
   }
 }, 1_000)

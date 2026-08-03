@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { once } from 'node:events'
 import { execFile } from 'node:child_process'
-import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import test from 'node:test'
@@ -62,9 +62,10 @@ test('serves agent-team tools through the MCP stdio protocol', async () => {
 
     const tools = await request('tools/list')
     const names = (tools.result as { tools: Array<{ name: string }> }).tools.map(tool => tool.name)
-    assert.ok(names.includes('team_create'))
-    assert.ok(names.includes('team_spawn'))
-    assert.ok(names.includes('team_adopt'))
+    assert.ok(names.includes('team_plan'))
+    assert.ok(names.includes('team_approve'))
+    assert.ok(names.includes('team_finalize'))
+    assert.ok(names.includes('team_report'))
     assert.ok(names.includes('team_resume'))
     assert.ok(names.includes('team_interrupt'))
     assert.ok(names.includes('organization_plan'))
@@ -74,47 +75,35 @@ test('serves agent-team tools through the MCP stdio protocol', async () => {
       .find(tool => tool.name === 'message_send')
     assert.ok(messageSend?.inputSchema.properties?.message_kind)
     assert.ok(messageSend?.inputSchema.properties?.requires_response)
-    const teamCreate = (tools.result as { tools: Array<{ name: string, inputSchema: { properties?: Record<string, unknown> } }> }).tools
-      .find(tool => tool.name === 'team_create')
-    assert.ok(teamCreate?.inputSchema.properties?.progress_check_interval_minutes)
-    assert.ok(teamCreate?.inputSchema.properties?.stalled_check_limit)
+    const teamPlan = (tools.result as { tools: Array<{ name: string, inputSchema: { properties?: Record<string, unknown> } }> }).tools
+      .find(tool => tool.name === 'team_plan')
+    assert.ok(teamPlan?.inputSchema.properties?.progress_check_interval_minutes)
+    assert.ok(teamPlan?.inputSchema.properties?.stalled_check_limit)
     const taskCreate = (tools.result as { tools: Array<{ name: string, inputSchema: { properties?: Record<string, unknown> } }> }).tools
       .find(tool => tool.name === 'task_create')
     assert.ok(taskCreate?.inputSchema.properties?.depends_on)
 
     const create = await request('tools/call', {
-      name: 'team_create',
+      name: 'team_plan',
       arguments: {
         team_name: 'MCP Feature',
         description: 'MCP test team',
-        leader_name: 'team-lead',
+        leader: { name: 'team-lead', prompt: 'Coordinate only the approved teammates.' },
+        teammates: [{ name: 'developer', prompt: 'Implement the approved work.' }],
         progress_check_interval_minutes: 5,
         stalled_check_limit: 2,
       },
     })
     const result = create.result as { content: Array<{ text: string }> }
-    assert.equal(JSON.parse(result.content[0]!.text).team_name, 'mcp-feature')
-    assert.equal(JSON.parse(result.content[0]!.text).progress_check_interval_minutes, 5)
-
-    const adopt = await request('tools/call', { name: 'team_adopt', arguments: {} })
-    const adoptResult = adopt.result as { content: Array<{ text: string }> }
-    assert.equal(JSON.parse(adoptResult.content[0]!.text).adopted, true)
-
-    const task = await request('tools/call', {
-      name: 'task_create',
-      arguments: { subject: 'Validate MCP', description: 'Create a task through JSON-RPC' },
+    const planPayload = JSON.parse(result.content[0]!.text)
+    assert.equal(planPayload.status, 'awaiting_user_approval')
+    assert.equal(planPayload.team.name, 'mcp-feature')
+    assert.equal(planPayload.required_user_approval, `APPROVE TEAM ${planPayload.plan_id}`)
+    const rejectedTeamApproval = await request('tools/call', {
+      name: 'team_approve',
+      arguments: { plan_id: planPayload.plan_id, user_approval: 'APPROVE TEAM other-plan' },
     })
-    const taskResult = task.result as { content: Array<{ text: string }> }
-    assert.equal(JSON.parse(taskResult.content[0]!.text).id, '1')
-
-    const acknowledgement = await request('tools/call', {
-      name: 'message_send',
-      arguments: { to: 'team-lead', message: 'Thanks.', message_kind: 'ack' },
-    })
-    const acknowledgementResult = acknowledgement.result as { content: Array<{ text: string }> }
-    const acknowledgementPayload = JSON.parse(acknowledgementResult.content[0]!.text)
-    assert.equal(acknowledgementPayload.message.messageKind, 'ack')
-    assert.equal(acknowledgementPayload.message.requiresResponse, false)
+    assert.equal((rejectedTeamApproval.result as { isError?: boolean }).isError, true)
 
     const organizationPlan = await request('tools/call', {
       name: 'organization_plan',
@@ -167,6 +156,28 @@ test('delivers owned tasks and exposes unassigned tasks separately from live wor
     ].join('\n'),
   )
   await chmod(fakeTmux, 0o755)
+  const statePath = join(projectRoot, '.poolside', 'agent-team', 'state.json')
+  await mkdir(join(projectRoot, '.poolside', 'agent-team'), { recursive: true })
+  await writeFile(statePath, JSON.stringify({
+    version: 2,
+    team: {
+      name: 'assignment-test',
+      createdAt: new Date().toISOString(),
+      lead: 'team-lead',
+      maxMembers: 4,
+      tmuxSession: 'pool-team-assignment-test',
+      progressCheckIntervalMinutes: 5,
+      maxStalledChecks: 2,
+    },
+    nextTaskNumber: 1,
+    nextMessageNumber: 1,
+    members: [
+      { name: 'team-lead', role: 'leader', joinedAt: new Date().toISOString(), status: 'running', tmuxPaneId: '%leader' },
+      { name: 'worker', role: 'teammate', joinedAt: new Date().toISOString(), status: 'running', tmuxPaneId: '%worker' },
+    ],
+    tasks: [],
+    messages: [],
+  }))
   const server = spawn(process.execPath, [resolve('dist/index.js')], {
     cwd: process.cwd(),
     env: {
@@ -174,6 +185,7 @@ test('delivers owned tasks and exposes unassigned tasks separately from live wor
       POOL_AGENT_TEAM_PROJECT_ROOT: projectRoot,
       POOL_AGENT_TEAM_TMUX_COMMAND: fakeTmux,
       POOL_AGENT_TEAM_TEST_TMUX_LOG: tmuxLog,
+      POOL_AGENT_TEAM_MEMBER: 'team-lead',
     },
     stdio: ['pipe', 'pipe', 'pipe'],
   })
@@ -208,24 +220,6 @@ test('delivers owned tasks and exposes unassigned tasks separately from live wor
       clientInfo: { name: 'agent-team-assignment-test', version: '1.0.0' },
     })
     server.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })}\n`)
-    const create = await request('tools/call', {
-      name: 'team_create',
-      arguments: { team_name: 'Assignment Test', leader_name: 'team-lead' },
-    })
-    const createPayload = create.result as { isError?: boolean, content: Array<{ text: string }> }
-    assert.equal(createPayload.isError, undefined, createPayload.content[0]?.text)
-    const statePath = join(projectRoot, '.poolside', 'agent-team', 'state.json')
-    const state = JSON.parse(await readFile(statePath, 'utf8')) as { members: Array<Record<string, unknown>> }
-    assert.equal(state.members.find(member => member.name === 'team-lead')?.tmuxPaneId, '%leader')
-    state.members.push({
-      name: 'worker',
-      role: 'teammate',
-      joinedAt: new Date().toISOString(),
-      status: 'running',
-      tmuxPaneId: '%worker',
-    })
-    await writeFile(statePath, JSON.stringify(state))
-
     const owned = await request('tools/call', {
       name: 'task_create',
       arguments: { subject: 'Implement assignment', description: 'Make the delivery observable.', owner: 'worker' },
