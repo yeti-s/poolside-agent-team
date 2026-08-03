@@ -9,8 +9,10 @@ test('renders the leader template with MCP-only coordination and the role prompt
     projectRoot: '/workspace/chat-ui',
     rolePrompt: 'Coordinate implementation delivery.',
   })
-  assert.match(instructions, /task_create\(\{ subject, description, owner \}\)/)
+  assert.match(instructions, /task_create\(\{ subject, description, owner, depends_on\? \}\)/)
   assert.match(instructions, /team_finalize/)
+  assert.match(instructions, /Assign independent, immediately executable tasks in parallel when that helps/)
+  assert.match(instructions, /leave a reviewer, tester, or other teammate idle/)
   assert.match(instructions, /Never use shell commands, tmux, tmux send-keys/)
   assert.match(instructions, /Coordinate implementation delivery\./)
   assert.match(instructions, /\/workspace\/chat-ui/)

@@ -49,7 +49,7 @@ test('creates one team and rejects a second active team', async () => {
   })
 })
 
-test('requires every teammate to receive initial work before clearing the leader assignment deadline', async () => {
+test('allows staged work after one executable initial teammate assignment', async () => {
   await withStore(async store => {
     await createTeam(store)
     await store.addMember({ name: 'developer', role: 'teammate', joinedAt: new Date().toISOString(), status: 'idle' })
@@ -58,8 +58,14 @@ test('requires every teammate to receive initial work before clearing the leader
     await store.beginWork()
     assert.ok((await store.read())?.team.initialAssignmentDeadlineAt)
     await store.addTask({ subject: 'Implement', description: 'Build the focused feature.', owner: 'developer' })
-    assert.ok((await store.read())?.team.initialAssignmentDeadlineAt)
-    await store.addTask({ subject: 'Verify', description: 'Validate the focused feature.', owner: 'tester' })
+    assert.equal((await store.read())?.team.initialAssignmentDeadlineAt, undefined)
+    const implementation = (await store.read())!.tasks[0]!
+    await store.addTask({
+      subject: 'Verify',
+      description: 'Validate the focused feature after implementation.',
+      owner: 'tester',
+      dependsOn: [implementation.id],
+    })
     assert.equal((await store.read())?.team.initialAssignmentDeadlineAt, undefined)
   })
 })

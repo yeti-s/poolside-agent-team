@@ -146,3 +146,10 @@ Use `depends_on` when one task must finish before another can start. The older
 `blocks` field is intentionally retained for compatibility, but has the inverse
 meaning: it lists tasks that the current task prevents from starting. Using
 `blocks` as a normal dependency can deadlock a team.
+
+The team leader chooses the execution schedule. Independent, ready tasks may be
+assigned in parallel. A reviewer, tester, or other teammate may remain idle
+until an implementation prerequisite is complete; represent that sequence with
+`depends_on`, or assign the later work only when it becomes ready. The initial
+leadership watchdog requires one executable first assignment, not an immediate
+assignment for every teammate.

@@ -161,7 +161,7 @@ function initialLeaderWorkPrompt(description: string): string {
     'The main Pool CLI has completed creation of every approved team member.',
     'Team objective:',
     description,
-    'Act as team leader only: create and assign concrete initial tasks to every teammate, then manage their work to completion. Do not implement product work yourself.',
+    'Act as team leader only. Create and assign the first executable work to the teammate(s) needed now. Run independent work in parallel when useful. For work that must wait (for example review or testing after implementation), create it with depends_on or assign it later after its prerequisite completes. Do not assign every approved teammate merely to keep them busy; an idle teammate is expected until suitable work is ready. Do not implement product work yourself.',
   ].join('\n\n')
 }
 
@@ -365,11 +365,11 @@ async function runLeaderProgressMonitor(): Promise<void> {
   }
 }
 
-function initialAssignmentPrompt(teammates: string[]): string {
+function initialAssignmentPrompt(): string {
   return [
-    'Automated leadership escalation: initial work has not been assigned to every approved teammate.',
-    `Immediately create and assign a concrete task to each of: ${teammates.join(', ')}.`,
-    'Do not inspect or modify project files, install dependencies, scaffold an application, or perform implementation work yourself. Use task_create and message_send only to establish the work plan.',
+    'Automated leadership escalation: no executable initial work has been assigned to a teammate.',
+    'Immediately create and assign the smallest concrete task that can start now. Use depends_on for later review, testing, or integration work; do not assign teammates simply to make every member busy.',
+    'Do not inspect or modify project files, install dependencies, scaffold an application, or perform implementation work yourself. Use task_create, task_update, and message_send only to establish the work plan.',
   ].join('\n')
 }
 
@@ -379,12 +379,14 @@ async function runInitialAssignmentMonitor(): Promise<void> {
   try {
     const state = await store.read()
     if (!state || state.team.lead !== callerName() || !state.team.initialAssignmentDeadlineAt) return
-    const teammates = state.members.filter(member => member.role === 'teammate')
-    if (teammates.length === 0) return
-    const unassigned = teammates.filter(member => !state.tasks.some(task =>
-      task.owner === member.name && task.status !== 'completed' && task.status !== 'decomposed',
-    ))
-    if (unassigned.length === 0) {
+    const hasExecutableAssignment = state.tasks.some(task =>
+      task.owner
+      && task.owner !== state.team.lead
+      && task.status !== 'completed'
+      && task.status !== 'decomposed'
+      && task.blockedBy.every(id => state.tasks.find(candidate => candidate.id === id)?.status === 'completed'),
+    )
+    if (hasExecutableAssignment) {
       await store.updateTeam(team => {
         team.initialAssignmentDeadlineAt = undefined
         team.initialAssignmentEscalatedAt = undefined
@@ -395,7 +397,7 @@ async function runInitialAssignmentMonitor(): Promise<void> {
     if (!Number.isFinite(deadline) || Date.now() < deadline) return
     const lastEscalation = Date.parse(state.team.initialAssignmentEscalatedAt ?? '')
     if (Number.isFinite(lastEscalation) && Date.now() - lastEscalation < 30_000) return
-    const prompt = initialAssignmentPrompt(unassigned.map(member => member.name))
+    const prompt = initialAssignmentPrompt()
     await store.updateTeam(team => { team.initialAssignmentEscalatedAt = new Date().toISOString() })
     await store.addMessage({ from: 'system', to: state.team.lead, body: prompt, kind: 'system', requiresResponse: true })
     const leader = state.members.find(member => member.name === state.team.lead)

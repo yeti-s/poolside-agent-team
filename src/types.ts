@@ -107,9 +107,9 @@ export interface TeamState {
     finalReport?: TeamFinalReport
     /** Last automatic reminder to submit a missing final report. */
     finalizationReminderAt?: string
-    /** Initial task distribution must be completed before this deadline. */
+    /** An executable initial teammate task must be assigned before this deadline. */
     initialAssignmentDeadlineAt?: string
-    /** Last time the leader was interrupted for failing to distribute initial work. */
+    /** Last time the leader was interrupted for failing to start executable initial work. */
     initialAssignmentEscalatedAt?: string
   }
   nextTaskNumber: number

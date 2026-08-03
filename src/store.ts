@@ -333,16 +333,7 @@ export class TeamStore {
         lastProgressNote: 'Task created',
       }
       state.tasks.push(created)
-      if (input.owner && input.owner !== state.team.lead) {
-        const teammates = state.members.filter(member => member.role === 'teammate')
-        const everyTeammateAssigned = teammates.length > 0 && teammates.every(member =>
-          state.tasks.some(task => task.owner === member.name && task.status !== 'completed' && task.status !== 'decomposed'),
-        )
-        if (everyTeammateAssigned) {
-          state.team.initialAssignmentDeadlineAt = undefined
-          state.team.initialAssignmentEscalatedAt = undefined
-        }
-      }
+      clearInitialAssignmentDeadlineWhenExecutable(state)
       for (const blockedTaskId of blocks) {
         const blocked = getTask(state, blockedTaskId)
         if (!blocked.blockedBy.includes(created.id)) blocked.blockedBy.push(created.id)
@@ -452,16 +443,7 @@ export class TeamStore {
         }
       }
       if (input.owner !== undefined) task.owner = input.owner ?? undefined
-      if (task.owner && task.owner !== state.team.lead) {
-        const teammates = state.members.filter(member => member.role === 'teammate')
-        const everyTeammateAssigned = teammates.length > 0 && teammates.every(member =>
-          state.tasks.some(candidate => candidate.owner === member.name && candidate.status !== 'completed' && candidate.status !== 'decomposed'),
-        )
-        if (everyTeammateAssigned) {
-          state.team.initialAssignmentDeadlineAt = undefined
-          state.team.initialAssignmentEscalatedAt = undefined
-        }
-      }
+      clearInitialAssignmentDeadlineWhenExecutable(state)
       const now = new Date().toISOString()
       task.updatedAt = now
       const progressNote = input.progressNote?.trim()
@@ -689,6 +671,19 @@ export function assertMember(state: TeamState, name: string): void {
   if (!state.members.some(member => member.name === name)) {
     throw new TeamError(`member "${name}" is not part of team "${state.team.name}"`)
   }
+}
+
+function clearInitialAssignmentDeadlineWhenExecutable(state: TeamState): void {
+  const hasExecutableAssignment = state.tasks.some(task =>
+    task.owner
+    && task.owner !== state.team.lead
+    && task.status !== 'completed'
+    && task.status !== 'decomposed'
+    && task.blockedBy.every(id => getTask(state, id).status === 'completed'),
+  )
+  if (!hasExecutableAssignment) return
+  state.team.initialAssignmentDeadlineAt = undefined
+  state.team.initialAssignmentEscalatedAt = undefined
 }
 
 function assertTaskIds(state: TeamState, ids: string[]): void {
