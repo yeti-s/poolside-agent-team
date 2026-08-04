@@ -1,4 +1,4 @@
-export const TASK_STATUSES = ['pending', 'in_progress', 'completed'] as const
+export const TASK_STATUSES = ['pending', 'in_progress', 'completed', 'decomposed'] as const
 export const MESSAGE_KINDS = ['task', 'handoff', 'decision', 'fyi', 'ack'] as const
 
 export type TaskStatus = (typeof TASK_STATUSES)[number]
@@ -42,6 +42,43 @@ export interface TeamTask {
   blockedBy: string[]
   createdAt: string
   updatedAt: string
+  /** Last timestamp at which the owner recorded a material task update. */
+  lastProgressAt?: string
+  /** Optional concise evidence supplied with the last material task update. */
+  lastProgressNote?: string
+  /** Consecutive leader watchdog checks with no recorded progress. */
+  stalledCheckCount?: number
+  /** Timestamp of the most recent no-progress watchdog check. */
+  lastStallCheckedAt?: string
+  /** Set once the watchdog has asked the owner to decompose the task. */
+  decompositionRequestedAt?: string
+  /** Child tasks created after this task was interrupted for lack of progress. */
+  decomposedInto?: string[]
+  /** Parent task when this is a focused recovery subtask. */
+  parentTaskId?: string
+  /** Higher values are delivered before ordinary pending work for the same owner. */
+  priority?: number
+}
+
+export interface TeamFinalReport {
+  status: 'completed' | 'blocked'
+  finalizedAt: string
+  summary: string
+  evidence: string
+  blockers?: string
+}
+
+/** A leader-authored execution plan that precedes creation of tracked tasks. */
+export interface TeamWorkPlan {
+  summary: string
+  steps: Array<{
+    id: string
+    subject: string
+    owner: string
+    dependsOn: string[]
+  }>
+  createdAt: string
+  updatedAt: string
 }
 
 export interface TeamMessage {
@@ -75,6 +112,20 @@ export interface TeamState {
     leaderPid?: number
     heartbeatAt?: string
     watchdogPid?: number
+    /** How often the leader watchdog reviews in-progress teammate tasks. */
+    progressCheckIntervalMinutes?: number
+    /** Consecutive unchanged reviews before a task must be decomposed. */
+    maxStalledChecks?: number
+    /** Written by team-lead when the team has a final outcome for the main CLI. */
+    finalReport?: TeamFinalReport
+    /** Leader-authored execution plan recorded before the first tracked task. */
+    workPlan?: TeamWorkPlan
+    /** Last automatic reminder to submit a missing final report. */
+    finalizationReminderAt?: string
+    /** An executable initial teammate task must be assigned before this deadline. */
+    initialAssignmentDeadlineAt?: string
+    /** Last time the leader was interrupted for failing to start executable initial work. */
+    initialAssignmentEscalatedAt?: string
   }
   nextTaskNumber: number
   nextMessageNumber: number

@@ -1,12 +1,7 @@
-import { execFile } from 'node:child_process'
 import { readFile } from 'node:fs/promises'
-import { promisify } from 'node:util'
 
 const statePath = process.argv[2]
 if (!statePath) throw new Error('organization watchdog requires state path')
-
-const execFileAsync = promisify(execFile)
-const tmuxCommand = process.env.POOL_AGENT_TEAM_TMUX_COMMAND || 'tmux'
 
 function isProcessAlive(pid: number): boolean {
   try {
@@ -17,18 +12,16 @@ function isProcessAlive(pid: number): boolean {
   }
 }
 
-async function cleanUpIfLeaderExited(): Promise<boolean> {
+async function stopIfLeaderExited(): Promise<boolean> {
   try {
     const state = JSON.parse(await readFile(statePath, 'utf8')) as {
       organization?: { leaderPid?: number }
-      teams?: Array<{ tmuxSession?: string }>
     }
     const leaderPid = state.organization?.leaderPid
     if (!leaderPid || isProcessAlive(leaderPid)) return false
-    await Promise.all((state.teams ?? [])
-      .map(team => team.tmuxSession)
-      .filter((session): session is string => Boolean(session))
-      .map(session => execFileAsync(tmuxCommand, ['kill-session', '-t', session]).catch(() => undefined)))
+    // Lifecycle belongs exclusively to the main Pool CLI. A departed main
+    // process makes this watchdog stop observing; it must never kill tmux or
+    // remove state on its own.
     return true
   } catch {
     // A removed state file means the organization has already been cleaned up.
@@ -37,7 +30,7 @@ async function cleanUpIfLeaderExited(): Promise<boolean> {
 }
 
 const timer = setInterval(() => {
-  void cleanUpIfLeaderExited().then(done => {
+  void stopIfLeaderExited().then(done => {
     if (done) {
       clearInterval(timer)
       process.exit(0)

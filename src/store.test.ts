@@ -44,7 +44,53 @@ test('creates one team and rejects a second active team', async () => {
     assert.equal(state.team.lead, 'team-lead')
     assert.equal(state.team.maxMembers, 4)
     assert.equal(state.members.length, 1)
+    assert.match(store.statePath, /\.poolside\/agent-team\/feature-x\/state\.json$/)
     await assert.rejects(() => createTeam(store, { teamName: 'other-team' }), TeamError)
+  })
+})
+
+test('allows staged work after one executable initial teammate assignment', async () => {
+  await withStore(async store => {
+    await createTeam(store)
+    await store.addMember({ name: 'developer', role: 'teammate', joinedAt: new Date().toISOString(), status: 'idle' })
+    await store.addMember({ name: 'tester', role: 'teammate', joinedAt: new Date().toISOString(), status: 'idle' })
+    assert.equal((await store.read())?.team.initialAssignmentDeadlineAt, undefined)
+    await store.beginWork()
+    assert.ok((await store.read())?.team.initialAssignmentDeadlineAt)
+    await store.addTask({ subject: 'Implement', description: 'Build the focused feature.', owner: 'developer' })
+    assert.equal((await store.read())?.team.initialAssignmentDeadlineAt, undefined)
+    const implementation = (await store.read())!.tasks[0]!
+    await store.addTask({
+      subject: 'Verify',
+      description: 'Validate the focused feature after implementation.',
+      owner: 'tester',
+      dependsOn: [implementation.id],
+    })
+    assert.equal((await store.read())?.team.initialAssignmentDeadlineAt, undefined)
+  })
+})
+
+test('records a validated execution plan before tracked task creation', async () => {
+  await withStore(async store => {
+    await createTeam(store)
+    await store.addMember({ name: 'developer', role: 'teammate', joinedAt: new Date().toISOString(), status: 'idle' })
+    await store.addMember({ name: 'reviewer', role: 'teammate', joinedAt: new Date().toISOString(), status: 'idle' })
+    const workPlan = await store.setWorkPlan({
+      summary: 'Implement first and review the completed result.',
+      steps: [
+        { id: 'implementation', subject: 'Implement feature', owner: 'developer' },
+        { id: 'review', subject: 'Review feature', owner: 'reviewer', dependsOn: ['implementation'] },
+      ],
+    })
+    assert.equal(workPlan.steps[1]?.dependsOn[0], 'implementation')
+    assert.equal((await store.read())?.team.workPlan?.summary, workPlan.summary)
+    await assert.rejects(
+      () => store.setWorkPlan({
+        summary: 'Invalid graph',
+        steps: [{ id: 'review', subject: 'Review', owner: 'reviewer', dependsOn: ['missing'] }],
+      }),
+      /unknown step/,
+    )
   })
 })
 
@@ -68,6 +114,22 @@ test('maintains task dependencies and refuses blocked work', async () => {
     await store.updateTask(client.id, { status: 'completed' })
     const updated = await store.updateTask(foundation.id, { status: 'in_progress' })
     assert.equal(updated.status, 'in_progress')
+  })
+})
+
+test('uses dependsOn for normal prerequisite ordering without reversing the relationship', async () => {
+  await withStore(async store => {
+    await createTeam(store)
+    const foundation = await store.addTask({ subject: 'Create API', description: 'Implement API foundation' })
+    const client = await store.addTask({
+      subject: 'Create client',
+      description: 'Implement the client after the API',
+      dependsOn: [foundation.id],
+    })
+    assert.deepEqual(client.blockedBy, [foundation.id])
+    await assert.rejects(() => store.updateTask(client.id, { status: 'in_progress' }), /blocked by: 1/)
+    await store.updateTask(foundation.id, { status: 'completed' })
+    assert.equal((await store.updateTask(client.id, { status: 'in_progress' })).status, 'in_progress')
   })
 })
 
@@ -144,6 +206,108 @@ test('preserves worker recovery metadata through state reads', async () => {
     assert.equal(member?.sessionId, '019fb2b6-3c2d-775f-bd7a-f64434859f06')
     assert.equal(member?.terminationReason, 'error')
     assert.equal(member?.restartCount, 2)
+  })
+})
+
+test('tracks unchanged work and requests decomposition after repeated leader reviews', async () => {
+  await withStore(async store => {
+    await createTeam(store)
+    await store.addMember({
+      name: 'developer',
+      role: 'teammate',
+      joinedAt: new Date().toISOString(),
+      status: 'running',
+    })
+    const task = await store.addTask({
+      subject: 'Implement feature',
+      description: 'Complete the feature end to end',
+      owner: 'developer',
+    })
+    await store.updateTask(task.id, { status: 'in_progress', progressNote: 'Started implementation.' })
+    const startedAt = Date.parse((await store.read())!.tasks[0]!.lastProgressAt!)
+    const first = await store.checkTaskProgress({
+      taskId: task.id,
+      intervalMs: 5 * 60_000,
+      maxStalledChecks: 2,
+      now: startedAt + 5 * 60_000,
+    })
+    assert.equal(first.status, 'remind')
+    assert.equal(first.task.stalledCheckCount, 1)
+    const second = await store.checkTaskProgress({
+      taskId: task.id,
+      intervalMs: 5 * 60_000,
+      maxStalledChecks: 2,
+      now: startedAt + 10 * 60_000,
+    })
+    assert.equal(second.status, 'decompose')
+    assert.equal(second.task.stalledCheckCount, 2)
+    assert.ok(second.task.decompositionRequestedAt)
+    const repeated = await store.checkTaskProgress({
+      taskId: task.id,
+      intervalMs: 5 * 60_000,
+      maxStalledChecks: 2,
+      now: startedAt + 15 * 60_000,
+    })
+    assert.equal(repeated.status, 'already_escalated')
+    await store.updateTask(task.id, { progressNote: 'Added a focused implementation step.' })
+    const progressed = await store.checkTaskProgress({
+      taskId: task.id,
+      intervalMs: 5 * 60_000,
+      maxStalledChecks: 2,
+      now: Date.now(),
+    })
+    assert.equal(progressed.status, 'active')
+    assert.equal(progressed.task.stalledCheckCount, 0)
+  })
+})
+
+test('decomposes a stalled task into prioritized focused work', async () => {
+  await withStore(async store => {
+    await createTeam(store)
+    await store.addMember({ name: 'developer', role: 'teammate', joinedAt: new Date().toISOString(), status: 'running' })
+    const parent = await store.addTask({ subject: 'Build chat', description: 'Implement the whole feature', owner: 'developer' })
+    await store.updateTask(parent.id, { status: 'in_progress' })
+    const result = await store.decomposeTask({
+      taskId: parent.id,
+      children: [
+        { subject: 'Define API', description: 'Write the narrow API contract', owner: 'developer' },
+        { subject: 'Implement API', description: 'Implement against the contract', owner: 'developer' },
+      ],
+    })
+    assert.equal(result.parent.status, 'decomposed')
+    assert.deepEqual(result.parent.decomposedInto, result.children.map(child => child.id))
+    assert.ok(result.children.every(child => child.parentTaskId === parent.id && child.priority === 100))
+  })
+})
+
+test('records a completed lead broadcast as the final-report fallback only after all work is terminal', async () => {
+  await withStore(async store => {
+    await createTeam(store)
+    await store.addMember({ name: 'developer', role: 'teammate', joinedAt: new Date().toISOString(), status: 'running' })
+    const first = await store.addTask({ subject: 'Build UI', description: 'Implement the UI.', owner: 'developer' })
+    const second = await store.addTask({ subject: 'Test UI', description: 'Validate the UI.', owner: 'developer' })
+    await store.updateTask(first.id, { status: 'completed', progressNote: 'Build passed.' })
+    assert.equal(await store.finalizeFromLeadBroadcast({ leader: 'team-lead', summary: 'All work completed.' }), undefined)
+    await store.updateTask(second.id, { status: 'completed', progressNote: 'Tests passed.' })
+    const report = await store.finalizeFromLeadBroadcast({ leader: 'team-lead', summary: 'All work completed.' })
+    assert.equal(report?.status, 'completed')
+    assert.match(report?.evidence ?? '', /All 2 tracked tasks/)
+    assert.equal((await store.read())?.team.finalReport?.summary, 'All work completed.')
+    assert.equal(await store.finalizeFromLeadBroadcast({ leader: 'team-lead', summary: 'Duplicate.' }), undefined)
+  })
+})
+
+test('stores a team plan without creating team state', async () => {
+  await withStore(async store => {
+    const plan = await store.createPlan({
+      teamName: 'planned-team',
+      description: 'Coordinate the approved work.',
+      leader: { name: 'team-lead', prompt: 'Coordinate approved work.' },
+      teammates: [{ name: 'developer', prompt: 'Implement focused work.' }],
+      maxMembers: 2,
+    })
+    assert.equal(await store.read(), undefined)
+    assert.equal((await store.getPlan(plan.id)).teamName, 'planned-team')
   })
 })
 

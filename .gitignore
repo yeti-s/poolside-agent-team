@@ -40,7 +40,10 @@ build/Release
 # Dependency directories
 node_modules/
 dist/
-.poolside/agent-team/
+.poolside/agent-team-archive/
+.poolside/agent-organization-archive/
+!.poolside/agent-team/**/*.log
+!.poolside/agent-organization/**/*.log
 # Poolside project-local state and private overrides
 .poolside/settings.local.yaml
 .poolside/plans/

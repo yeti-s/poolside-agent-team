@@ -1,18 +1,47 @@
-import { mkdir, open, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { mkdir, open, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import type {
   PublicTeamStatus,
   TaskStatus,
   TeamMember,
+  TeamFinalReport,
   TeamMessage,
   TeamState,
   TeamTask,
+  TeamWorkPlan,
 } from './types.js'
 
 const LOCK_RETRY_MS = 25
 const LOCK_TIMEOUT_MS = 5_000
 export const DEFAULT_MAX_MEMBERS = 4
 export const LEADER_HEARTBEAT_TIMEOUT_MS = 8_000
+export const DEFAULT_PROGRESS_CHECK_INTERVAL_MINUTES = 5
+export const DEFAULT_MAX_STALLED_CHECKS = 2
+export const INITIAL_ASSIGNMENT_TIMEOUT_MS = 60_000
+
+export interface TaskProgressCheck {
+  task: TeamTask
+  status: 'active' | 'remind' | 'decompose' | 'already_escalated'
+}
+
+export interface PlannedTeamMember {
+  name: string
+  prompt: string
+  agentName?: string
+  model?: string
+}
+
+export interface TeamCreationPlan {
+  id: string
+  teamName: string
+  description: string
+  leader: PlannedTeamMember
+  teammates: PlannedTeamMember[]
+  maxMembers: number
+  progressCheckIntervalMinutes?: number
+  maxStalledChecks?: number
+  createdAt: string
+}
 
 export class TeamError extends Error {}
 
@@ -33,15 +62,80 @@ export function validateMemberName(name: string): string {
 }
 
 export class TeamStore {
-  readonly statePath: string
-  private readonly lockPath: string
+  private resolvedStatePath?: string
+  private readonly legacyStatePath: string
+  private readonly planPath: string
 
   constructor(readonly projectRoot: string, statePath?: string) {
-    this.statePath = statePath ?? join(projectRoot, '.poolside', 'agent-team', 'state.json')
-    this.lockPath = join(dirname(this.statePath), 'state.lock')
+    this.resolvedStatePath = statePath
+    this.legacyStatePath = join(projectRoot, '.poolside', 'agent-team', 'state.json')
+    this.planPath = statePath
+      ? join(dirname(statePath), 'plans.json')
+      : join(projectRoot, '.poolside', 'agent-team', 'plans.json')
+  }
+
+  get statePath(): string {
+    return this.resolvedStatePath ?? this.legacyStatePath
+  }
+
+  private get lockPath(): string {
+    return join(dirname(this.statePath), 'state.lock')
+  }
+
+  private async resolveActiveStatePath(): Promise<void> {
+    if (this.resolvedStatePath) return
+    try {
+      await readFile(this.legacyStatePath, 'utf8')
+      return
+    } catch (error: unknown) {
+      if (!isNotFound(error)) throw error
+    }
+    const root = dirname(this.legacyStatePath)
+    try {
+      const entries = await readdir(root, { withFileTypes: true })
+      const teamDirectories = entries.filter(entry => entry.isDirectory()).map(entry => join(root, entry.name, 'state.json'))
+      const existing: string[] = []
+      for (const candidate of teamDirectories) {
+        try {
+          await readFile(candidate, 'utf8')
+          existing.push(candidate)
+        } catch (error: unknown) {
+          if (!isNotFound(error)) throw error
+        }
+      }
+      if (existing.length === 1) this.resolvedStatePath = existing[0]
+      if (existing.length > 1) throw new TeamError('multiple active standalone team states were found')
+    } catch (error: unknown) {
+      if (!isNotFound(error)) throw error
+    }
+  }
+
+  async createPlan(input: Omit<TeamCreationPlan, 'id' | 'createdAt'>): Promise<TeamCreationPlan> {
+    const release = await this.acquireLock()
+    try {
+      const plans = await this.readPlans()
+      const plan: TeamCreationPlan = {
+        ...input,
+        id: `team-plan-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        createdAt: new Date().toISOString(),
+      }
+      plans.push(plan)
+      await mkdir(dirname(this.planPath), { recursive: true })
+      await writeFile(this.planPath, `${JSON.stringify(plans, null, 2)}\n`, 'utf8')
+      return plan
+    } finally {
+      await release()
+    }
+  }
+
+  async getPlan(id: string): Promise<TeamCreationPlan> {
+    const plan = (await this.readPlans()).find(item => item.id === id)
+    if (!plan) throw new TeamError(`team plan "${id}" was not found`)
+    return plan
   }
 
   async read(): Promise<TeamState | undefined> {
+    await this.resolveActiveStatePath()
     try {
       return normalizeState(JSON.parse(await readFile(this.statePath, 'utf8')))
     } catch (error: unknown) {
@@ -57,7 +151,12 @@ export class TeamStore {
     tmuxSession: string
     leaderPid: number
     leaderName?: string
+    progressCheckIntervalMinutes?: number
+    maxStalledChecks?: number
   }): Promise<TeamState> {
+    if (!this.resolvedStatePath) {
+      this.resolvedStatePath = join(this.projectRoot, '.poolside', 'agent-team', sanitizeTeamName(input.teamName), 'state.json')
+    }
     return this.mutate(async current => {
       if (current) throw new TeamError(`team "${current.team.name}" already exists`)
       const now = new Date().toISOString()
@@ -72,6 +171,8 @@ export class TeamStore {
           tmuxSession: input.tmuxSession,
           leaderPid: input.leaderPid,
           heartbeatAt: now,
+          progressCheckIntervalMinutes: input.progressCheckIntervalMinutes ?? DEFAULT_PROGRESS_CHECK_INTERVAL_MINUTES,
+          maxStalledChecks: input.maxStalledChecks ?? DEFAULT_MAX_STALLED_CHECKS,
         },
         nextTaskNumber: 1,
         nextMessageNumber: 1,
@@ -92,6 +193,7 @@ export class TeamStore {
   async mutate(
     action: (current: TeamState | undefined) => Promise<TeamState> | TeamState,
   ): Promise<TeamState> {
+    await this.resolveActiveStatePath()
     const release = await this.acquireLock()
     try {
       const result = await action(await this.read())
@@ -106,11 +208,74 @@ export class TeamStore {
   }
 
   async remove(): Promise<void> {
+    await this.resolveActiveStatePath()
     const release = await this.acquireLock()
     try {
       await rm(dirname(this.statePath), { recursive: true, force: true })
     } finally {
       await release()
+    }
+  }
+
+  /** Start leadership monitoring only after the main CLI has delivered the initial team objective. */
+  async beginWork(): Promise<TeamState> {
+    return this.updateTeam(team => {
+      if (!team.initialAssignmentDeadlineAt) {
+        team.initialAssignmentDeadlineAt = new Date(Date.now() + INITIAL_ASSIGNMENT_TIMEOUT_MS).toISOString()
+      }
+    })
+  }
+
+  /** Record the leader's execution graph before tracked task creation begins. */
+  async setWorkPlan(input: {
+    summary: string
+    steps: Array<{ id: string, subject: string, owner: string, dependsOn?: string[] }>
+  }): Promise<TeamWorkPlan> {
+    let saved!: TeamWorkPlan
+    await this.mutate(current => {
+      const state = requireTeam(current)
+      const stepIds = new Set<string>()
+      for (const step of input.steps) {
+        const id = step.id.trim()
+        if (!id) throw new TeamError('work-plan step IDs must not be empty')
+        if (stepIds.has(id)) throw new TeamError(`duplicate work-plan step ID "${id}"`)
+        assertMember(state, step.owner)
+        stepIds.add(id)
+      }
+      for (const step of input.steps) {
+        const id = step.id.trim()
+        const dependencies = step.dependsOn ?? []
+        if (dependencies.includes(id)) throw new TeamError(`work-plan step "${id}" cannot depend on itself`)
+        for (const dependency of dependencies) {
+          if (!stepIds.has(dependency)) {
+            throw new TeamError(`work-plan step "${id}" depends on unknown step "${dependency}"`)
+          }
+        }
+      }
+      const now = new Date().toISOString()
+      saved = {
+        summary: input.summary.trim(),
+        steps: input.steps.map(step => ({
+          id: step.id.trim(),
+          subject: step.subject.trim(),
+          owner: step.owner,
+          dependsOn: [...new Set(step.dependsOn ?? [])],
+        })),
+        createdAt: state.team.workPlan?.createdAt ?? now,
+        updatedAt: now,
+      }
+      state.team.workPlan = saved
+      return state
+    })
+    return saved
+  }
+
+  private async readPlans(): Promise<TeamCreationPlan[]> {
+    try {
+      return JSON.parse(await readFile(this.planPath, 'utf8')) as TeamCreationPlan[]
+    } catch (error: unknown) {
+      if (isNotFound(error)) return []
+      throw error
     }
   }
 
@@ -154,18 +319,48 @@ export class TeamStore {
     })
   }
 
+  /**
+   * A completed-team broadcast is the durable fallback when a lead omits the
+   * explicit team_finalize call. It is intentionally accepted only after all
+   * tracked work has reached a terminal state.
+   */
+  async finalizeFromLeadBroadcast(input: { leader: string, summary: string }): Promise<TeamFinalReport | undefined> {
+    let report: TeamFinalReport | undefined
+    await this.mutate(current => {
+      const state = requireTeam(current)
+      if (state.team.lead !== input.leader || state.team.finalReport || state.tasks.length === 0 || hasUnresolvedTasks(state)) return state
+      const completed = state.tasks
+        .map(task => `#${task.id} ${task.subject}: ${(task.lastProgressNote ?? 'completed').slice(0, 500)}`)
+        .join('\n')
+      report = {
+        status: 'completed',
+        finalizedAt: new Date().toISOString(),
+        summary: input.summary.trim(),
+        evidence: `All ${state.tasks.length} tracked tasks reached a terminal state.\n${completed}`.slice(0, 20_000),
+      }
+      state.team.finalReport = report
+      return state
+    })
+    return report
+  }
+
   async addTask(input: {
     subject: string
     description: string
     owner?: string
     blocks?: string[]
+    dependsOn?: string[]
+    parentTaskId?: string
+    priority?: number
   }): Promise<TeamTask> {
     let created!: TeamTask
     await this.mutate(current => {
       const state = requireTeam(current)
       if (input.owner) assertMember(state, input.owner)
       const blocks = input.blocks ?? []
+      const dependsOn = input.dependsOn ?? []
       assertTaskIds(state, blocks)
+      assertTaskIds(state, dependsOn)
       const now = new Date().toISOString()
       created = {
         id: String(state.nextTaskNumber++),
@@ -174,11 +369,16 @@ export class TeamStore {
         status: 'pending',
         owner: input.owner,
         blocks,
-        blockedBy: [],
+        blockedBy: [...new Set(dependsOn)],
+        parentTaskId: input.parentTaskId,
+        priority: input.priority ?? 0,
         createdAt: now,
         updatedAt: now,
+        lastProgressAt: now,
+        lastProgressNote: 'Task created',
       }
       state.tasks.push(created)
+      clearInitialAssignmentDeadlineWhenExecutable(state)
       for (const blockedTaskId of blocks) {
         const blocked = getTask(state, blockedTaskId)
         if (!blocked.blockedBy.includes(created.id)) blocked.blockedBy.push(created.id)
@@ -186,6 +386,58 @@ export class TeamStore {
       return state
     })
     return created
+  }
+
+  async decomposeTask(input: {
+    taskId: string
+    children: Array<{ subject: string, description: string, owner: string, dependsOn?: string[] }>
+  }): Promise<{ parent: TeamTask, children: TeamTask[] }> {
+    let result!: { parent: TeamTask, children: TeamTask[] }
+    await this.mutate(current => {
+      const state = requireTeam(current)
+      const parent = getTask(state, input.taskId)
+      if (parent.status === 'completed' || parent.status === 'decomposed') {
+        throw new TeamError(`task "${parent.id}" cannot be decomposed from status "${parent.status}"`)
+      }
+      if (input.children.length < 2 || input.children.length > 4) {
+        throw new TeamError('a decomposition must contain between 2 and 4 child tasks')
+      }
+      const now = new Date().toISOString()
+      const children: TeamTask[] = []
+      for (const childInput of input.children) {
+        assertMember(state, childInput.owner)
+        const dependsOn = [...new Set(childInput.dependsOn ?? [])]
+        if (dependsOn.includes(parent.id)) throw new TeamError('a decomposition child cannot depend on its parent')
+        assertTaskIds(state, dependsOn)
+        const child: TeamTask = {
+          id: String(state.nextTaskNumber++),
+          subject: childInput.subject.trim(),
+          description: childInput.description.trim(),
+          status: 'pending',
+          owner: childInput.owner,
+          blocks: [],
+          blockedBy: dependsOn,
+          parentTaskId: parent.id,
+          priority: 100,
+          createdAt: now,
+          updatedAt: now,
+          lastProgressAt: now,
+          lastProgressNote: `Created from stalled task #${parent.id}`,
+        }
+        state.tasks.push(child)
+        children.push(child)
+      }
+      parent.status = 'decomposed'
+      parent.decomposedInto = children.map(child => child.id)
+      parent.updatedAt = now
+      parent.lastProgressAt = now
+      parent.lastProgressNote = `Interrupted and decomposed into tasks: ${parent.decomposedInto.join(', ')}`
+      parent.stalledCheckCount = 0
+      parent.lastStallCheckedAt = undefined
+      result = { parent: structuredClone(parent), children: structuredClone(children) }
+      return state
+    })
+    return result
   }
 
   async updateTask(
@@ -196,6 +448,8 @@ export class TeamStore {
       status?: TaskStatus
       owner?: string | null
       blocks?: string[]
+      dependsOn?: string[]
+      progressNote?: string
     },
   ): Promise<TeamTask> {
     let updated!: TeamTask
@@ -203,6 +457,7 @@ export class TeamStore {
       const state = requireTeam(current)
       const task = getTask(state, id)
       if (input.owner !== undefined && input.owner !== null) assertMember(state, input.owner)
+      const previous = structuredClone(task)
       if (input.blocks) {
         if (input.blocks.includes(id)) throw new TeamError('a task cannot block itself')
         assertTaskIds(state, input.blocks)
@@ -216,6 +471,11 @@ export class TeamStore {
           if (!newBlocked.blockedBy.includes(id)) newBlocked.blockedBy.push(id)
         }
       }
+      if (input.dependsOn) {
+        if (input.dependsOn.includes(id)) throw new TeamError('a task cannot depend on itself')
+        assertTaskIds(state, input.dependsOn)
+        task.blockedBy = [...new Set(input.dependsOn)]
+      }
       if (input.subject !== undefined) task.subject = input.subject.trim()
       if (input.description !== undefined) task.description = input.description.trim()
       if (input.status !== undefined) task.status = input.status
@@ -228,7 +488,24 @@ export class TeamStore {
         }
       }
       if (input.owner !== undefined) task.owner = input.owner ?? undefined
-      task.updatedAt = new Date().toISOString()
+      clearInitialAssignmentDeadlineWhenExecutable(state)
+      const now = new Date().toISOString()
+      task.updatedAt = now
+      const progressNote = input.progressNote?.trim()
+      const madeProgress = Boolean(progressNote)
+        || task.subject !== previous.subject
+        || task.description !== previous.description
+        || task.status !== previous.status
+        || task.owner !== previous.owner
+        || JSON.stringify(task.blocks) !== JSON.stringify(previous.blocks)
+        || JSON.stringify(task.blockedBy) !== JSON.stringify(previous.blockedBy)
+      if (madeProgress) {
+        task.lastProgressAt = now
+        task.lastProgressNote = progressNote ?? task.lastProgressNote
+        task.stalledCheckCount = 0
+        task.lastStallCheckedAt = undefined
+        task.decompositionRequestedAt = undefined
+      }
       updated = structuredClone(task)
       return state
     })
@@ -264,6 +541,46 @@ export class TeamStore {
     return created
   }
 
+  /**
+   * Record one leader watchdog review. A task is escalated only once per
+   * unchanged stretch; a material task update resets its stall counter.
+   */
+  async checkTaskProgress(input: {
+    taskId: string
+    intervalMs: number
+    maxStalledChecks: number
+    now?: number
+  }): Promise<TaskProgressCheck> {
+    let result!: TaskProgressCheck
+    await this.mutate(current => {
+      const state = requireTeam(current)
+      const task = getTask(state, input.taskId)
+      const now = input.now ?? Date.now()
+      const progressAt = Date.parse(task.lastProgressAt ?? task.updatedAt)
+      if (!Number.isFinite(progressAt) || now - progressAt < input.intervalMs) {
+        result = { task: structuredClone(task), status: 'active' }
+        return state
+      }
+      const lastCheckAt = Date.parse(task.lastStallCheckedAt ?? '')
+      task.stalledCheckCount = Number.isFinite(lastCheckAt) && lastCheckAt >= progressAt
+        ? (task.stalledCheckCount ?? 0) + 1
+        : 1
+      task.lastStallCheckedAt = new Date(now).toISOString()
+      if (task.stalledCheckCount >= input.maxStalledChecks) {
+        if (!task.decompositionRequestedAt) {
+          task.decompositionRequestedAt = task.lastStallCheckedAt
+          result = { task: structuredClone(task), status: 'decompose' }
+        } else {
+          result = { task: structuredClone(task), status: 'already_escalated' }
+        }
+      } else {
+        result = { task: structuredClone(task), status: 'remind' }
+      }
+      return state
+    })
+    return result
+  }
+
   async messagesFor(name: string, markRead: boolean): Promise<TeamMessage[]> {
     let messages: TeamMessage[] = []
     await this.mutate(current => {
@@ -296,6 +613,7 @@ export class TeamStore {
       pending: 0,
       in_progress: 0,
       completed: 0,
+      decomposed: 0,
     }
     for (const task of state.tasks) taskSummary[task.status] += 1
     return {
@@ -355,7 +673,7 @@ export class TeamStore {
 }
 
 export function requireTeam(state: TeamState | undefined): TeamState {
-  if (!state) throw new TeamError('no team exists in this project; call team_create first')
+  if (!state) throw new TeamError('no team exists in this project; create an approved plan with team_plan, then call team_approve')
   return state
 }
 
@@ -388,6 +706,8 @@ function normalizeState(raw: unknown): TeamState {
       lead: state.team.lead ?? 'team-lead',
       maxMembers,
       tmuxSession,
+      progressCheckIntervalMinutes: state.team.progressCheckIntervalMinutes ?? DEFAULT_PROGRESS_CHECK_INTERVAL_MINUTES,
+      maxStalledChecks: state.team.maxStalledChecks ?? DEFAULT_MAX_STALLED_CHECKS,
     } as TeamState['team'],
   }
 }
@@ -398,6 +718,19 @@ export function assertMember(state: TeamState, name: string): void {
   }
 }
 
+function clearInitialAssignmentDeadlineWhenExecutable(state: TeamState): void {
+  const hasExecutableAssignment = state.tasks.some(task =>
+    task.owner
+    && task.owner !== state.team.lead
+    && task.status !== 'completed'
+    && task.status !== 'decomposed'
+    && task.blockedBy.every(id => getTask(state, id).status === 'completed'),
+  )
+  if (!hasExecutableAssignment) return
+  state.team.initialAssignmentDeadlineAt = undefined
+  state.team.initialAssignmentEscalatedAt = undefined
+}
+
 function assertTaskIds(state: TeamState, ids: string[]): void {
   for (const id of ids) getTask(state, id)
 }
@@ -406,6 +739,10 @@ function getTask(state: TeamState, id: string): TeamTask {
   const task = state.tasks.find(item => item.id === id)
   if (!task) throw new TeamError(`task "${id}" was not found`)
   return task
+}
+
+export function hasUnresolvedTasks(state: TeamState): boolean {
+  return state.tasks.some(task => task.status === 'pending' || task.status === 'in_progress')
 }
 
 function isNotFound(error: unknown): error is NodeJS.ErrnoException {

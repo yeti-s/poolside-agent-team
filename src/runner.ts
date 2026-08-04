@@ -1,7 +1,7 @@
 import { execFile, spawn } from 'node:child_process'
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { promisify } from 'node:util'
 import type { TeamStore } from './store.js'
 import type { TeamMember } from './types.js'
@@ -26,6 +26,8 @@ export interface SpawnWorkerInput {
   resumeSessionId?: string
   /** A coordination message to queue immediately after startup or resume. */
   recoveryMessage?: string
+  /** Return after the pane and member record are ready; discovery continues in the worker. */
+  waitForSessionId?: boolean
 }
 export interface SpawnedWorker {
   pid: number
@@ -43,9 +45,62 @@ type WorkerConfig = SpawnWorkerInput & {
   sessionIdPath: string
   fallbackPoolArgs?: string[]
   statePath: string
+  role?: TeamMember['role']
 }
 
 let workerLaunchQueue: Promise<void> = Promise.resolve()
+
+/** MCP tools deliberately available inside a team-lead Pool session. */
+export const TEAM_LEADER_MCP_TOOLS = [
+  'team_list',
+  'team_status',
+  'team_work_plan',
+  'task_create',
+  'task_list',
+  'task_update',
+  'task_decompose',
+  'message_send',
+  'message_list',
+  'team_resume',
+  'team_interrupt',
+  'team_finalize',
+] as const
+
+const ORGANIZATION_TEAM_LEADER_MCP_TOOLS = ['organization_message_send'] as const
+
+/** MCP tools deliberately available inside a non-leader team member session. */
+export const TEAMMATE_MCP_TOOLS = [
+  'task_list',
+  'task_update',
+  'message_send',
+  'message_list',
+] as const
+
+export function mcpToolsForWorker(
+  role?: TeamMember['role'],
+  organizationName?: string,
+): readonly string[] {
+  if (role !== 'leader') return TEAMMATE_MCP_TOOLS
+  return organizationName
+    ? [...TEAM_LEADER_MCP_TOOLS, ...ORGANIZATION_TEAM_LEADER_MCP_TOOLS]
+    : TEAM_LEADER_MCP_TOOLS
+}
+
+function buildWorkerSettings(input: SpawnWorkerInput): string {
+  const mcpEntrypoint = fileURLToPath(new URL('./index.js', import.meta.url))
+  const enabledTools = mcpToolsForWorker(input.role, input.organizationName)
+  return [
+    'mcp_servers:',
+    '  agent-team:',
+    `    command: ${JSON.stringify('node')}`,
+    '    args:',
+    `      - ${JSON.stringify(mcpEntrypoint)}`,
+    `    cwd: ${JSON.stringify(input.projectRoot)}`,
+    '    enabled_tools:',
+    ...enabledTools.map(tool => `      - ${JSON.stringify(tool)}`),
+    '',
+  ].join('\n')
+}
 
 function tmuxCommand(): string {
   return process.env.POOL_AGENT_TEAM_TMUX_COMMAND || 'tmux'
@@ -87,8 +142,7 @@ export async function createTeamTmuxSession(input: {
     throw new Error(`tmux session "${input.session}" already exists`)
   }
   const runDirectory = input.runtimeDirectory
-    ? join(input.runtimeDirectory, 'run')
-    : join(input.projectRoot, '.poolside', 'agent-team', 'run')
+    ?? join(input.projectRoot, '.poolside', 'agent-team')
   await mkdir(runDirectory, { recursive: true })
   const dashboardPath = join(runDirectory, 'team-status.sh')
   await writeFile(
@@ -132,23 +186,22 @@ async function spawnPoolWorkerSerial(
   input: SpawnWorkerInput,
   store: TeamStore,
 ): Promise<SpawnedWorker> {
-  const teamDirectory = input.runtimeDirectory ?? join(input.projectRoot, '.poolside', 'agent-team')
-  const runDirectory = join(teamDirectory, 'run')
-  const logsDirectory = join(teamDirectory, 'logs')
-  await Promise.all([mkdir(runDirectory, { recursive: true }), mkdir(logsDirectory, { recursive: true })])
+  const teamDirectory = input.runtimeDirectory ?? join(input.projectRoot, '.poolside', 'agent-team', input.teamName)
+  const agentDirectory = join(teamDirectory, `${input.teamName}-${input.name}`)
+  await mkdir(agentDirectory, { recursive: true })
 
-  const logPath = join(logsDirectory, `${input.name}.log`)
-  const configPath = join(runDirectory, `${input.name}.json`)
-  const sessionIdPath = join(runDirectory, `${input.name}.session.json`)
+  const logPath = join(agentDirectory, `${input.name}.log`)
+  const configPath = join(agentDirectory, `${input.name}.json`)
+  const sessionIdPath = join(agentDirectory, `${input.name}.session.json`)
+  const instructionsPath = join(agentDirectory, 'AGENTS.md')
+  const settingsPath = join(agentDirectory, '.poolside', 'settings.local.yaml')
   const workerEntrypoint = fileURLToPath(new URL('./worker.js', import.meta.url))
   const poolCommand = process.env.POOL_AGENT_TEAM_POOL_COMMAND || 'pool'
   const basePoolArgs = [
     '--directory',
-    input.projectRoot,
+    agentDirectory,
     '--mode',
     'always-allow',
-    '--prompt-queue',
-    buildWorkerPrompt({ ...input, resumeSessionId: undefined }),
   ]
   if (input.recoveryMessage) basePoolArgs.push('--prompt-queue', buildRecoveryPrompt(input.recoveryMessage))
   if (input.model) basePoolArgs.push('--model', input.model)
@@ -164,8 +217,12 @@ async function spawnPoolWorkerSerial(
     sessionIdPath,
     fallbackPoolArgs: input.resumeSessionId ? basePoolArgs : undefined,
     statePath: store.statePath,
+    role: input.role,
   }
-  await rm(sessionIdPath, { force: true })
+  await writeFile(sessionIdPath, JSON.stringify({ complete: false }), { mode: 0o600 })
+  await writeFile(instructionsPath, input.prompt, { mode: 0o600 })
+  await mkdir(dirname(settingsPath), { recursive: true })
+  await writeFile(settingsPath, buildWorkerSettings(input), { mode: 0o600 })
   await writeFile(configPath, `${JSON.stringify(config)}\n`, { mode: 0o600 })
 
   const teamWindowTarget = `${input.tmuxSession}:${TEAM_WINDOW}`
@@ -223,7 +280,9 @@ async function spawnPoolWorkerSerial(
     await store.addMember(makeMember(input, spawned))
   }
 
-  const sessionId = input.resumeSessionId ?? await waitForSessionId(sessionIdPath)
+  const sessionId = input.resumeSessionId ?? (input.waitForSessionId === false
+    ? undefined
+    : await waitForSessionId(sessionIdPath))
   if (sessionId && !input.resumeSessionId) {
     await store.updateMember(input.name, member => {
       member.sessionId = sessionId
@@ -308,23 +367,6 @@ export function startOrganizationWatchdog(input: { statePath: string }): number 
   child.unref()
   if (!child.pid) throw new Error('organization watchdog did not provide a process ID')
   return child.pid
-}
-
-function buildWorkerPrompt(input: SpawnWorkerInput): string {
-  return [
-    `You are ${input.role === 'leader' ? 'the team leader' : 'a teammate'} "${input.name}" in Pool agent team "${input.teamName}"${input.organizationName ? ` of organization "${input.organizationName}"` : ''}.`,
-    'Use the agent-team MCP tools for all coordination.',
-    'Start by checking task_list and message_list. Work only on tasks assigned to you or explicitly ask the lead before claiming work.',
-    'A later direct coordination message from team-lead is an explicit task assignment, even when task_list has no unfinished task assigned to you. Execute it and report the result with message_send; do not dismiss it because earlier work is complete.',
-    'After completing work, call task_update to mark it completed when there is a matching task, send a concise message to the requester or team-lead, then remain available for a later coordination message. Only leave the team after an explicit shutdown request.',
-    input.role === 'leader'
-      ? 'You may create and manage teammates only in your own team. Use organization_message_send only to exchange opinions with another team leader. Do not contact another team\'s teammates directly.'
-      : 'You cannot create teammates or delete the team. Do not communicate with members outside your own team.',
-    'Do not modify files outside the requested project.',
-    '',
-    'Assigned work:',
-    input.prompt,
-  ].join('\n')
 }
 
 function buildRecoveryPrompt(message: string): string {

@@ -18,6 +18,7 @@ type WorkerConfig = {
   model?: string
   organizationName?: string
   statePath: string
+  role?: 'leader' | 'teammate'
 }
 
 const configPath = process.argv[2]
